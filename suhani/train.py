@@ -90,6 +90,8 @@ def feature_engineering(df):
 
     for col in FEATURE_COLS + ["PM_ratio"]:
         df[f"{col}_lag1"] = df[col].shift(1)
+        df[f"{col}_lag3"] = df[col].shift(3)
+        df[f"{col}_lag7"] = df[col].shift(7)
 
     # Rolling exposure (best practice for health/admissions)
     for col in ["PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value"]:
@@ -103,10 +105,16 @@ def feature_engineering(df):
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
     df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
 
-    # Lagged target (best practice for time series: yesterday's admissions is highly predictive)
+    # Lagged target (1-, 3-, 7-day lags)
     df["admissions_lag1"] = df[TARGET_COL].shift(1)
+    df["admissions_lag3"] = df[TARGET_COL].shift(3)
+    df["admissions_lag7"] = df[TARGET_COL].shift(7)
 
-    lag_cols = [f"{c}_lag1" for c in FEATURE_COLS] + ["PM_ratio_lag1", "admissions_lag1"]
+    lag_cols = (
+        [f"{c}_lag1" for c in FEATURE_COLS] + ["PM_ratio_lag1", "admissions_lag1"]
+        + [f"{c}_lag3" for c in FEATURE_COLS] + ["PM_ratio_lag3", "admissions_lag3"]
+        + [f"{c}_lag7" for c in FEATURE_COLS] + ["PM_ratio_lag7", "admissions_lag7"]
+    )
     df = df.dropna(how="any", subset=lag_cols)
     return df.reset_index(drop=True)
 
@@ -114,7 +122,11 @@ def feature_engineering(df):
 def get_feature_columns():
     """Names of columns used as model inputs."""
     base = FEATURE_COLS + ["PM_ratio"]
-    lags = [f"{c}_lag1" for c in FEATURE_COLS] + ["PM_ratio_lag1", "admissions_lag1"]
+    lags = (
+        [f"{c}_lag1" for c in FEATURE_COLS] + ["PM_ratio_lag1", "admissions_lag1"]
+        + [f"{c}_lag3" for c in FEATURE_COLS] + ["PM_ratio_lag3", "admissions_lag3"]
+        + [f"{c}_lag7" for c in FEATURE_COLS] + ["PM_ratio_lag7", "admissions_lag7"]
+    )
     rolls = [
         "PM2.5 (µg/m³)_roll3", "PM2.5 (µg/m³)_roll7",
         "PM10 (µg/m³)_roll3", "PM10 (µg/m³)_roll7",
@@ -125,9 +137,11 @@ def get_feature_columns():
 
 
 def get_reduced_feature_columns():
-    """Minimal set for generalization: lagged target + key exposure + time."""
+    """Minimal set for generalization: lagged target (1,3,7) + key exposure + time."""
     return [
         "admissions_lag1",
+        "admissions_lag3",
+        "admissions_lag7",
         "PM2.5 (µg/m³)_roll7",
         "PM10 (µg/m³)_roll7",
         "Index Value_roll7",
