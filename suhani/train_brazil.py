@@ -1,9 +1,9 @@
 """
-Predict Number of Admissions from air quality and weather (merged_data.csv).
+Brazil: predict hospitalizations from pollutants (pollutants_and_hosp.csv).
 
-Pipeline: load → preprocess (impute/drop missing, winsorize) → feature engineering
-(lags, rolling means, cyclical time) → time-ordered train/val/test split → scale features
-→ train multiple regression models → report comparison table and best model by Test R².
+Data: date (Data), 8 SIH hospitalization columns (summed → target), 12 pollutant columns
+(pm25/pm10/so2/no2/co/o3 for GV and Sul). Pipeline: load → preprocess → feature engineering
+→ time-ordered split → scale → train models → report comparison and best Test R².
 """
 
 import os
@@ -25,25 +25,31 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (Brazil: pollutants_and_hosp.csv)
 # ---------------------------------------------------------------------------
 
-USE_IMPUTATION = True  # If True, impute missing features (ffill/bfill); else drop rows
+USE_IMPUTATION = True
 
-TIMESTAMP_COL = "Timestamp"
-TARGET_COL = "Number of Admissions"
-FEATURE_COLS = [
-    "PM2.5 (µg/m³)",
-    "PM10 (µg/m³)",
-    "Index Value",
-    "temperature_2m_max (°C)",
-    "apparent_temperature_max (°C)",
-    "Ozone (µg/m³)",
-    "NO2 (µg/m³)",
-    "CO (mg/m³)",
-    "RH (%)",
-    "temperature_2m_min (°C)",
+DATA_FILE = "pollutants_and_hosp.csv"
+DATE_COL = "Date"  # after renaming "Data"
+TARGET_COL = "hospitalizations"  # sum of SIH_* columns
+
+# Hospitalization count columns to sum into target
+SIH_COLS = [
+    "SIH_Sul_I_Old", "SIH_Sul_J_Old", "SIH_Sul_I_Kid", "SIH_Sul_J_Kid",
+    "SIH_GV_I_Old", "SIH_GV_J_Old", "SIH_GV_I_Kid", "SIH_GV_J_Kid",
 ]
+
+# Pollutant features (GV = Grande Vitória, Sul = Sul region)
+FEATURE_COLS = [
+    "pm25.gv", "pm10.gv", "so2.gv", "no2.gv", "co.gv", "o3.gv",
+    "co.sul", "o3.sul", "no2.sul", "so2.sul", "pm10.sul", "pm25.sul",
+]
+
+# For PM_ratio and rolling (must be in FEATURE_COLS)
+PM25_COL = "pm25.gv"
+PM10_COL = "pm10.gv"
+ROLLING_COLS = ["pm25.gv", "pm10.gv", "no2.gv"]
 
 
 # ---------------------------------------------------------------------------
@@ -51,21 +57,24 @@ FEATURE_COLS = [
 # ---------------------------------------------------------------------------
 
 def load_data():
-    """Load CSV, keep timestamp + feature columns + target, parse date."""
+    """Load Brazil CSV, parse date, build target as sum of SIH columns, keep pollutants."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(script_dir, "data", "merged_data.csv")
+    path = os.path.join(script_dir, "data", DATA_FILE)
     df = pd.read_csv(path)
-    cols = [TIMESTAMP_COL] + [c for c in FEATURE_COLS if c in df.columns] + [TARGET_COL]
-    df = df[[c for c in cols if c in df.columns]].copy()
-    if TIMESTAMP_COL in df.columns:
-        df["Date"] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
-        df = df.drop(columns=[TIMESTAMP_COL])
+    df = df.rename(columns={"Data": DATE_COL})
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=[DATE_COL])
+    # Target = total hospitalizations (sum of 8 SIH columns)
+    available_sih = [c for c in SIH_COLS if c in df.columns]
+    df[TARGET_COL] = df[available_sih].sum(axis=1)
+    keep = [DATE_COL] + [c for c in FEATURE_COLS if c in df.columns] + [TARGET_COL]
+    df = df[keep].copy()
     return df
 
 
 def preprocess_data(df, impute_features=False):
     """Drop rows with missing target; optionally impute or drop missing features. Winsorize target at 99th percentile."""
-    df = df.sort_values("Date").copy()
+    df = df.sort_values(DATE_COL).copy()
     df = df.dropna(subset=[TARGET_COL])
     if impute_features:
         for col in FEATURE_COLS:
@@ -84,29 +93,25 @@ def preprocess_data(df, impute_features=False):
 # ---------------------------------------------------------------------------
 
 def feature_engineering(df):
-    """Add PM ratio, temp range, 1/3/7/14-day lags, 3/7/14-day rolling means, cyclical time, weekend. Drop rows with NaN from lags."""
-    df = df.sort_values("Date").reset_index(drop=True)
+    """Add PM ratio, 1/3/7/14-day lags, 3/7/14-day rolling means, cyclical time, weekend. Drop rows with NaN from lags."""
+    df = df.sort_values(DATE_COL).reset_index(drop=True)
     base_cols = [c for c in FEATURE_COLS if c in df.columns]
 
-    if "PM2.5 (µg/m³)" in df.columns and "PM10 (µg/m³)" in df.columns:
-        pm25, pm10 = df["PM2.5 (µg/m³)"], df["PM10 (µg/m³)"]
+    if PM25_COL in df.columns and PM10_COL in df.columns:
+        pm25, pm10 = df[PM25_COL], df[PM10_COL]
         df["PM_ratio"] = np.where(pm10 > 0, pm25 / pm10, np.nan)
         df["PM_ratio"] = df["PM_ratio"].fillna(df["PM_ratio"].median())
         base_cols = base_cols + ["PM_ratio"]
-
-    tmax, tmin = "temperature_2m_max (°C)", "temperature_2m_min (°C)"
-    if tmax in df.columns and tmin in df.columns:
-        df["temp_range"] = df[tmax] - df[tmin]
 
     for col in base_cols:
         for lag in (1, 3, 7, 14):
             df[f"{col}_lag{lag}"] = df[col].shift(lag)
 
-    for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
+    for col in [c for c in ROLLING_COLS if c in df.columns]:
         for w in (3, 7, 14):
             df[f"{col}_roll{w}"] = df[col].rolling(w, min_periods=1).mean()
 
-    dt = pd.to_datetime(df["Date"])
+    dt = pd.to_datetime(df[DATE_COL])
     df["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
@@ -125,19 +130,19 @@ def feature_engineering(df):
 
 def get_feature_columns():
     """List of feature column names (only those present in df are used in split)."""
-    base = [c for c in FEATURE_COLS] + ["PM_ratio", "temp_range"]
+    base = [c for c in FEATURE_COLS] + ["PM_ratio"]
     lags = [f"{c}_lag{lag}" for c in base for lag in (1, 3, 7, 14)]
     lags += [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
-    rolls = [f"{r}_roll{w}" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (3, 7, 14)]
+    rolls = [f"{r}_roll{w}" for r in ROLLING_COLS for w in (3, 7, 14)]
     time_ = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
     return base + lags + rolls + time_
 
 
 def get_reduced_feature_columns():
-    """Reduced set: admission lags + key rolling + time (for Ridge/ElasticNet reduced)."""
+    """Reduced set: admission lags + key rolling + time (for Ridge reduced)."""
     return [
         "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
-        "PM2.5 (µg/m³)_roll7", "PM2.5 (µg/m³)_roll14", "PM10 (µg/m³)_roll7", "Index Value_roll7",
+        "pm25.gv_roll7", "pm25.gv_roll14", "pm10.gv_roll7", "no2.gv_roll7",
         "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
     ]
 
@@ -291,6 +296,7 @@ def main():
     n_fe = len(df)
     X_train, X_val, X_test, y_train, y_val, y_test, _ = training_data_split(df)
 
+    print("Brazil: pollutants_and_hosp.csv")
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
     print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
