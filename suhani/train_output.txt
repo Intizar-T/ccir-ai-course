@@ -1,0 +1,29 @@
+WARNING:tensorflow:5 out of the last 10 calls to <function TensorFlowTrainer.make_predict_function.<locals>.one_step_on_data_distributed at 0x168dd8360> triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has reduce_retracing=True option that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/guide/function#controlling_retracing and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+WARNING:tensorflow:6 out of the last 12 calls to <function TensorFlowTrainer.make_predict_function.<locals>.one_step_on_data_distributed at 0x168dd8360> triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has reduce_retracing=True option that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/guide/function#controlling_retracing and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+Data: load → preprocess → feature_eng
+  Rows: 724 → 724 (impute=True) → 710
+  Train / Val / Test: 568 / 71 / 71
+
+Keras (Hyperopt tuning on reduced features, 10 trials)...
+Model comparison (Validation | Test)
+------------------------------------------------------------------------
+Model               Val MAE Val RMSE   Val R²  |  Test MAE Test RMSE  Test R²
+------------------------------------------------------------------------
+Dummy (mean)         9.0824  11.3007  -0.0040  |    8.0985  10.1883  -0.0303
+Ridge (CV)           8.3394  10.7777   0.0867  |    7.0404   9.5444   0.0958
+Ridge (log y)        7.8153  10.1056   0.1971  |    7.0513   9.2599   0.1489
+ElasticNet (CV)      7.9642  10.4020   0.1493  |    7.0553   9.1618   0.1668
+Ridge (reduced)      7.6142   9.5566   0.2820  |    7.3074   8.9975   0.1964
+Random Forest        8.9943  11.6728  -0.0712  |    7.6772  10.2492  -0.0427
+Gradient Boosting    9.3665  11.8123  -0.0970  |    7.6059  10.3960  -0.0728
+Hist Gradient Boosting   9.4349  12.2034  -0.1709  |    7.8877  10.5987  -0.1150
+Extra Trees          9.0686  11.5085  -0.0413  |    7.9551  10.3180  -0.0567
+FNN (MLP)           13.5858  18.0725  -1.5679  |   14.4393  18.9200  -2.5532
+SVR                  8.8044  11.0204   0.0451  |    7.9948   9.9816   0.0110
+XGBoost              8.6708  10.9257   0.0615  |    7.6689  10.0935  -0.0112
+Keras (default)      8.8647  11.2254   0.0093  |   10.2784  12.1596  -0.4676
+Keras (tuned)        7.0808   9.1910   0.3358  |    7.8416   9.6060   0.0841
+Stacking (Ridge+EN+GB+Keras+XGB+RidgeLog)   6.2673   8.2627   0.4632  |    8.1523  10.0216   0.0031
+------------------------------------------------------------------------
+
+Best by Test R²: Ridge (reduced)  (R² = 0.1964)
