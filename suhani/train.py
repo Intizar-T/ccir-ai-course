@@ -10,16 +10,16 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.dummy import DummyRegressor
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNetCV, Ridge, RidgeCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.svm import SVR
 
 import tensorflow as tf
 from tensorflow import keras
-from keras import layers
+from tensorflow.keras import layers
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 
 try:
@@ -30,10 +30,15 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (tweak for experiments)
 # ---------------------------------------------------------------------------
 
 USE_IMPUTATION = True  # If True, impute missing features (ffill/bfill); else drop rows
+WINSORIZE_QUANTILE = 0.99  # 0.99 = 99th percentile; try 0.95 for less clipping
+TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10  # time-ordered split
+USE_EXTRA_FEATURES = True  # day_of_year, rolling_std, trend (diff of roll7)
+SCALER_TYPE = "standard"  # "standard" | "robust"
+KERAS_TRIALS = 50
 
 TIMESTAMP_COL = "Timestamp"
 TARGET_COL = "Number of Admissions"
@@ -79,8 +84,8 @@ def preprocess_data(df, impute_features=False):
         df = df.dropna(subset=[c for c in FEATURE_COLS if c in df.columns])
     else:
         df = df.dropna(subset=[c for c in FEATURE_COLS if c in df.columns])
-    q99 = df[TARGET_COL].quantile(0.99)
-    df.loc[df[TARGET_COL] > q99, TARGET_COL] = q99
+    q = df[TARGET_COL].quantile(WINSORIZE_QUANTILE)
+    df.loc[df[TARGET_COL] > q, TARGET_COL] = q
     return df.reset_index(drop=True)
 
 
@@ -110,13 +115,22 @@ def feature_engineering(df):
     for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
         for w in (3, 7, 14):
             df[f"{col}_roll{w}"] = df[col].rolling(w, min_periods=1).mean()
+            if USE_EXTRA_FEATURES and w >= 7:
+                df[f"{col}_roll{w}_std"] = df[col].rolling(w, min_periods=1).std().fillna(0)
 
+    if USE_EXTRA_FEATURES:
+        for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
+            r7 = df[col].rolling(7, min_periods=1).mean()
+            df[f"{col}_trend7"] = r7.diff().fillna(0)
     dt = pd.to_datetime(df["Date"])
     df["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
     df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
     df["weekend"] = (dt.dt.dayofweek >= 5).astype(np.float64)
+    if USE_EXTRA_FEATURES:
+        df["day_of_year_sin"] = np.sin(2 * np.pi * dt.dt.dayofyear / 365.25)
+        df["day_of_year_cos"] = np.cos(2 * np.pi * dt.dt.dayofyear / 365.25)
 
     for lag in (1, 3, 7, 14):
         df[f"admissions_lag{lag}"] = df[TARGET_COL].shift(lag)
@@ -135,11 +149,16 @@ def get_feature_columns():
     lags += [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
     rolls = [f"{r}_roll{w}" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (3, 7, 14)]
     time_ = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
-    return base + lags + rolls + time_
+    out = base + lags + rolls + time_
+    if USE_EXTRA_FEATURES:
+        rolls_std = [f"{r}_roll{w}_std" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (7, 14)]
+        trends = [f"{r}_trend7" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value")]
+        out = out + rolls_std + trends + ["day_of_year_sin", "day_of_year_cos"]
+    return out
 
 
 def get_reduced_feature_columns():
-    """Reduced set: admission lags + key rolling + time (for Ridge/ElasticNet reduced)."""
+    """Reduced set: admission lags + key rolling + time."""
     return [
         "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
         "PM2.5 (µg/m³)_roll7", "PM2.5 (µg/m³)_roll14", "PM10 (µg/m³)_roll7", "Index Value_roll7",
@@ -151,8 +170,11 @@ def get_reduced_feature_columns():
 # Split & scale
 # ---------------------------------------------------------------------------
 
-def training_data_split(df, train_frac=0.70, val_frac=0.15, test_frac=0.15):
-    """Time-ordered split. Scale features with StandardScaler fitted on train only."""
+def training_data_split(df, train_frac=None, val_frac=None, test_frac=None):
+    """Time-ordered split. Scale features with scaler fitted on train only."""
+    train_frac = train_frac if train_frac is not None else TRAIN_FRAC
+    val_frac = val_frac if val_frac is not None else VAL_FRAC
+    test_frac = test_frac if test_frac is not None else TEST_FRAC
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-9
     feat_cols = [c for c in get_feature_columns() if c in df.columns]
     if not feat_cols:
@@ -169,7 +191,7 @@ def training_data_split(df, train_frac=0.70, val_frac=0.15, test_frac=0.15):
     y_train = y.iloc[:n_train]
     y_val = y.iloc[n_train : n_train + n_val]
     y_test = y.iloc[n_train + n_val :]
-    scaler = StandardScaler()
+    scaler = RobustScaler() if SCALER_TYPE == "robust" else StandardScaler()
     X_train = pd.DataFrame(scaler.fit_transform(X_train), columns=feat_cols, index=X_train.index)
     X_val = pd.DataFrame(scaler.transform(X_val), columns=feat_cols, index=X_val.index)
     X_test = pd.DataFrame(scaler.transform(X_test), columns=feat_cols, index=X_test.index)
@@ -259,6 +281,14 @@ def xgboost_model(random_state=42):
     if not HAS_XGB:
         raise ImportError("xgboost not installed")
     return xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=random_state)
+
+
+def hist_gradient_boosting_model(random_state=42):
+    return HistGradientBoostingRegressor(max_iter=150, max_depth=6, learning_rate=0.05, min_samples_leaf=15, random_state=random_state)
+
+
+def extra_trees_model(random_state=42):
+    return ExtraTreesRegressor(n_estimators=150, max_depth=12, min_samples_leaf=5, random_state=random_state)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +422,8 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
         ("Ridge (reduced)", RidgeReduced()),
         ("Random Forest", random_forest_regression_model()),
         ("Gradient Boosting", gradient_boosting_model()),
+        ("Hist Gradient Boosting", hist_gradient_boosting_model()),
+        ("Extra Trees", extra_trees_model()),
         ("FNN (MLP)", fnn_model()),
         ("SVR", svm_model()),
     ]
@@ -415,9 +447,7 @@ def main():
     n_pre = len(df)
     df = feature_engineering(df)
     n_fe = len(df)
-    X_train, X_val, X_test, y_train, y_val, y_test, _ = training_data_split(
-        df, train_frac=0.80, val_frac=0.10, test_frac=0.10
-    )
+    X_train, X_val, X_test, y_train, y_val, y_test, _ = training_data_split(df)
 
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
@@ -426,19 +456,21 @@ def main():
     results = run_all_models(X_train, X_val, X_test, y_train, y_val, y_test)
 
     reduced_cols = [c for c in get_reduced_feature_columns() if c in X_train.columns]
-    if reduced_cols:
+    KERAS_USE_REDUCED = True  # Set False to tune Keras on full features
+    if reduced_cols and KERAS_USE_REDUCED:
         X_train_r, X_val_r, X_test_r = X_train[reduced_cols], X_val[reduced_cols], X_test[reduced_cols]
-        print("Keras (Hyperopt tuning on reduced features, 50 trials)...")
+        print(f"Keras (Hyperopt tuning on reduced features, {KERAS_TRIALS} trials)...")
         keras_wrapper, keras_tuned_test = run_keras_hyperopt(
-            X_train_r, y_train, X_val_r, y_val, X_test_r, y_test, max_evals=50
+            X_train_r, y_train, X_val_r, y_val, X_test_r, y_test, max_evals=KERAS_TRIALS
         )
         keras_val = evaluate_model(keras_wrapper, X_val_r, y_val)
     else:
-        print("Keras (Hyperopt tuning, 50 trials)...")
+        print(f"Keras (Hyperopt tuning full features, {KERAS_TRIALS} trials)...")
         keras_wrapper, keras_tuned_test = run_keras_hyperopt(
-            X_train, y_train, X_val, y_val, X_test, y_test, max_evals=50
+            X_train, y_train, X_val, y_val, X_test, y_test, max_evals=KERAS_TRIALS
         )
         keras_val = evaluate_model(keras_wrapper, X_val, y_val)
+        reduced_cols = list(X_train.columns)  # Keras sees all features
     results.append(("Keras (tuned)", keras_val, keras_tuned_test))
 
     ridge_r = RidgeReduced()
@@ -447,43 +479,89 @@ def main():
     enet.fit(X_train, y_train)
     gb = gradient_boosting_model()
     gb.fit(X_train, y_train)
+    hist_gb = hist_gradient_boosting_model()
+    hist_gb.fit(X_train, y_train)
+    extra_trees = extra_trees_model()
+    extra_trees.fit(X_train, y_train)
+    xgb_m = None
+    if HAS_XGB:
+        xgb_m = xgboost_model()
+        xgb_m.fit(X_train, y_train)
+    ridge_log = RidgeLogTarget()
+    ridge_log.fit(X_train, y_train)
 
+    X_val_k = X_val[reduced_cols] if reduced_cols else X_val
     p_val_r = ridge_r.predict(X_val).reshape(-1, 1)
     p_val_e = enet.predict(X_val).reshape(-1, 1)
     p_val_g = gb.predict(X_val).reshape(-1, 1)
-    X_val_k = X_val[reduced_cols] if reduced_cols else X_val
+    p_val_h = hist_gb.predict(X_val).reshape(-1, 1)
+    p_val_et = extra_trees.predict(X_val).reshape(-1, 1)
     p_val_k = keras_wrapper.predict(X_val_k).reshape(-1, 1)
-    # Try both 3-model (Ridge+EN+Keras) and 4-model (Ridge+EN+GB+Keras) stacks, keep best by val R²
+    p_val_x = xgb_m.predict(X_val).reshape(-1, 1) if HAS_XGB else None
+    p_val_log = ridge_log.predict(X_val).reshape(-1, 1)
     P_val_3 = np.hstack([p_val_r, p_val_e, p_val_k])
-    P_val_4 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k])
     meta_3 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_3, y_val)
+    r2_best = r2_score(y_val, meta_3.predict(P_val_3))
+    meta = meta_3
+    use_gb, use_xgb, use_log, use_hist_gb, use_et = False, False, False, False, False
+    P_val_4 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k])
     meta_4 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_4, y_val)
-    r2_3 = r2_score(y_val, meta_3.predict(P_val_3))
-    r2_4 = r2_score(y_val, meta_4.predict(P_val_4))
-    use_4 = r2_4 >= r2_3
-    meta = meta_4 if use_4 else meta_3
+    if r2_score(y_val, meta_4.predict(P_val_4)) > r2_best:
+        r2_best, meta, use_gb, use_hist_gb, use_et = r2_score(y_val, meta_4.predict(P_val_4)), meta_4, True, False, False
+    if HAS_XGB:
+        P_val_5 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k, p_val_x])
+        meta_5 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_5, y_val)
+        if r2_score(y_val, meta_5.predict(P_val_5)) > r2_best:
+            meta, use_gb, use_xgb, use_hist_gb, use_et = meta_5, True, True, False, False
+        P_val_x3 = np.hstack([p_val_r, p_val_e, p_val_k, p_val_x])
+        meta_x3 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_x3, y_val)
+        if r2_score(y_val, meta_x3.predict(P_val_x3)) > r2_best:
+            meta, use_gb, use_xgb, use_hist_gb, use_et = meta_x3, False, True, False, False
+    P_val_6 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k, p_val_x, p_val_log]) if HAS_XGB else np.hstack([p_val_r, p_val_e, p_val_g, p_val_k, p_val_log])
+    meta_6 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_6, y_val)
+    if r2_score(y_val, meta_6.predict(P_val_6)) > r2_best:
+        meta, use_gb, use_xgb, use_log, use_hist_gb, use_et = meta_6, True, HAS_XGB, True, False, False
 
     class StackingPredictor:
-        def __init__(self, ridge, enet, gb, keras_w, meta, use_reduced, use_gb):
-            self.ridge, self.enet, self.gb, self.keras_w = ridge, enet, gb, keras_w
+        def __init__(self, ridge, enet, gb, hist_gb, et, keras_w, xgb_m, ridge_log, meta, use_reduced, use_gb, use_xgb, use_log, use_hist_gb, use_et):
+            self.ridge, self.enet, self.gb = ridge, enet, gb
+            self.hist_gb, self.et = hist_gb, et
+            self.keras_w, self.xgb_m, self.ridge_log = keras_w, xgb_m, ridge_log
             self.meta = meta
             self.use_reduced = use_reduced
-            self.use_gb = use_gb
+            self.use_gb, self.use_xgb, self.use_log = use_gb, use_xgb, use_log
+            self.use_hist_gb, self.use_et = use_hist_gb, use_et
         def predict(self, X):
             X_k = X[reduced_cols] if self.use_reduced and reduced_cols else X
             pr = self.ridge.predict(X).reshape(-1, 1)
             pe = self.enet.predict(X).reshape(-1, 1)
             pk = self.keras_w.predict(X_k).reshape(-1, 1)
+            parts = [pr, pe, pk]
             if self.use_gb:
-                pg = self.gb.predict(X).reshape(-1, 1)
-                P = np.hstack([pr, pe, pg, pk])
-            else:
-                P = np.hstack([pr, pe, pk])
-            return self.meta.predict(P)
-    ens = StackingPredictor(ridge_r, enet, gb, keras_wrapper, meta, use_reduced=bool(reduced_cols), use_gb=use_4)
+                parts.insert(2, self.gb.predict(X).reshape(-1, 1))
+            elif self.use_hist_gb:
+                parts.insert(2, self.hist_gb.predict(X).reshape(-1, 1))
+            elif self.use_et:
+                parts.insert(2, self.et.predict(X).reshape(-1, 1))
+            if self.use_xgb and HAS_XGB:
+                parts.append(self.xgb_m.predict(X).reshape(-1, 1))
+            if self.use_log:
+                parts.append(self.ridge_log.predict(X).reshape(-1, 1))
+            return self.meta.predict(np.hstack(parts))
+    ens = StackingPredictor(ridge_r, enet, gb, hist_gb, extra_trees, keras_wrapper, xgb_m if HAS_XGB else None, ridge_log, meta, bool(reduced_cols), use_gb, use_xgb, use_log, use_hist_gb, use_et)
     ens_val_metrics = evaluate_model(ens, X_val, y_val)
     ens_test_metrics = evaluate_model(ens, X_test, y_test)
-    stack_name = "Stacking (Ridge+EN+GB+Keras)" if use_4 else "Stacking (Ridge+EN+Keras)"
+    stack_name = "Stacking (Ridge+EN+Keras)"
+    if use_gb:
+        stack_name = stack_name.replace("+Keras)", "+GB+Keras)")
+    if use_hist_gb:
+        stack_name = stack_name.replace("+Keras)", "+HistGB+Keras)")
+    if use_et:
+        stack_name = stack_name.replace("+Keras)", "+ET+Keras)")
+    if use_xgb and HAS_XGB:
+        stack_name = stack_name.replace(")", "+XGB)")
+    if use_log:
+        stack_name = stack_name.replace(")", "+RidgeLog)")
     results.append((stack_name, ens_val_metrics, ens_test_metrics))
 
     print("Model comparison (Validation | Test)")
