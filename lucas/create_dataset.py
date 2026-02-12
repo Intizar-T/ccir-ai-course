@@ -163,11 +163,17 @@ for i in range(0, len(unique_tickers), batch_size):
             if not ticker_data.empty:
                 # Reset index to get date as a column
                 ticker_data = ticker_data.reset_index()
+                # Flatten multi-level columns if present (yfinance varies by version)
+                if isinstance(ticker_data.columns, pd.MultiIndex):
+                    ticker_data.columns = ticker_data.columns.get_level_values(0)
+                # Explicit rename by column name - robust to yfinance column order changes
+                rename_map = {'Date': 'date', 'Datetime': 'date', 'Open': 'open', 'High': 'high',
+                             'Low': 'low', 'Close': 'close', 'Adj Close': 'close_adj', 'Volume': 'volume'}
+                ticker_data = ticker_data.rename(columns={k: v for k, v in rename_map.items() if k in ticker_data.columns})
+                if 'close_adj' in ticker_data.columns:
+                    ticker_data['close'] = ticker_data['close_adj']
+                    ticker_data = ticker_data.drop(columns=['close_adj'], errors='ignore')
                 ticker_data['ticker'] = ticker
-                
-                # Rename columns to match expected format
-                ticker_data.columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'ticker']
-                
                 prices_list.append(ticker_data[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']])
                 batch_success += 1
                 success_count += 1
@@ -205,6 +211,29 @@ else:
     print("ERROR: Failed to fetch data for any ticker")
     prices = pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
 
+# Fetch S&P 500 for market-adjusted (excess) returns
+print(f"\nFetching S&P 500 (^GSPC) for market benchmark...")
+sp500_data = yf.download('^GSPC', start=start_date, end=end_date, progress=False, auto_adjust=True)
+if not sp500_data.empty:
+    sp500_data = sp500_data.reset_index()
+    if isinstance(sp500_data.columns, pd.MultiIndex):
+        sp500_data.columns = sp500_data.columns.get_level_values(0)
+    rename_map = {'Date': 'date', 'Datetime': 'date', 'Open': 'open', 'High': 'high',
+                 'Low': 'low', 'Close': 'close', 'Adj Close': 'close_adj', 'Volume': 'volume'}
+    sp500_data = sp500_data.rename(columns={k: v for k, v in rename_map.items() if k in sp500_data.columns})
+    if 'close_adj' in sp500_data.columns:
+        sp500_data['close'] = sp500_data['close_adj']
+    sp500_data = sp500_data[['date', 'close']].copy()
+    sp500_data['date'] = pd.to_datetime(sp500_data['date'])
+    sp500_data = sp500_data.sort_values('date').reset_index(drop=True)
+    sp500_data['close_7td'] = sp500_data['close'].shift(-7)
+    sp500_data['sp500_return_7td'] = (sp500_data['close_7td'] - sp500_data['close']) / sp500_data['close']
+    sp500_returns = sp500_data[['date', 'sp500_return_7td']].dropna()
+    print(f"  S&P 500 data: {len(sp500_returns)} rows with valid 7-trading-day returns")
+else:
+    sp500_returns = pd.DataFrame(columns=['date', 'sp500_return_7td'])
+    print("  WARNING: Could not fetch S&P 500 - excess returns will be NaN")
+
 # Check ticker overlap
 insider_tickers = set(transactions['ticker'].unique())
 market_tickers = set(prices['ticker'].unique())
@@ -226,23 +255,33 @@ features = features[features['ticker'].isin(market_tickers)].reset_index(drop=Tr
 print(f"\nFiltered transactions: {transactions.shape}")
 print(f"Filtered features: {features.shape}")
 
-# Calculate forward returns for 7-day horizon only
-prices['close_7d'] = prices.groupby('ticker')['close'].shift(-7)
-prices['return_7d'] = (prices['close_7d'] - prices['close']) / prices['close']
+# Calculate 7-trading-day forward returns (shift(-7) = 7 trading days, not calendar)
+prices['close_7td'] = prices.groupby('ticker')['close'].shift(-7)
+prices['return_7td'] = (prices['close_7td'] - prices['close']) / prices['close']
 
-# Remove rows where we can't calculate 7-day forward returns (near the end of data)
-prices_complete = prices[prices['return_7d'].notna()].copy()
+# Market-adjusted (excess) return: Stock return - S&P 500 return (same period)
+prices = prices.merge(sp500_returns, on='date', how='left')
+prices['excess_return_7td'] = prices['return_7td'] - prices['sp500_return_7td']
 
-print(f"Added 7-day forward returns")
+# Remove rows where we can't calculate 7-trading-day forward returns (near the end of data)
+prices_complete = prices[prices['return_7td'].notna()].copy()
+
+print(f"Added 7-trading-day forward returns and market-adjusted (excess) returns")
 print(f"Rows with complete forward returns: {prices_complete.shape[0]}")
-print(f"\nReturn statistics:")
-mean_return = prices_complete['return_7d'].mean()
-std_return = prices_complete['return_7d'].std()
-print(f"7-day: mean={mean_return:.2%}, std={std_return:.2%}")
+print(f"\nReturn statistics (raw 7-trading-day):")
+mean_return = prices_complete['return_7td'].mean()
+std_return = prices_complete['return_7td'].std()
+print(f"  return_7td: mean={mean_return:.2%}, std={std_return:.2%}")
+if prices_complete['excess_return_7td'].notna().any():
+    mean_excess = prices_complete['excess_return_7td'].mean()
+    std_excess = prices_complete['excess_return_7td'].std()
+    print(f"\nExcess return (vs S&P 500):")
+    print(f"  excess_return_7td: mean={mean_excess:.2%}, std={std_excess:.2%}")
 
 # Merge transactions with price data
+price_cols = ['ticker', 'date', 'close', 'return_7td', 'excess_return_7td']
 transactions_with_prices = transactions.merge(
-    prices[['ticker', 'date', 'close', 'return_7d']],
+    prices[price_cols],
     left_on=['ticker', 'transaction_date'],
     right_on=['ticker', 'date'],
     how='inner'
@@ -254,18 +293,18 @@ print(f"Match rate: {transactions_with_prices.shape[0] / transactions.shape[0]:.
 # Show sample
 print(f"\nSample of transactions with prices:")
 print(transactions_with_prices[['ticker', 'transaction_date', 'is_buy', 'shares', 
-                                 'transaction_value', 'close', 'return_7d']].head(10))
+                                 'transaction_value', 'close', 'return_7td', 'excess_return_7td']].head(10))
 
 # Merge features with price data
 features_with_prices = features.merge(
-    prices[['ticker', 'date', 'close', 'return_7d']],
+    prices[price_cols],
     left_on=['ticker', 'transaction_date'],
     right_on=['ticker', 'date'],
     how='inner'
 ).drop('date', axis=1)
 
 # Keep only rows with complete forward returns
-features_with_prices = features_with_prices[features_with_prices['return_7d'].notna()]
+features_with_prices = features_with_prices[features_with_prices['return_7td'].notna()]
 
 # Add total shares outstanding
 features_with_prices['total_shares_count'] = features_with_prices['ticker'].map(shares_outstanding_dict)
@@ -284,27 +323,30 @@ print(f"\nSample of features with prices:")
 if len(features_with_prices) > 0:
     print(features_with_prices[['ticker', 'transaction_date', 'num_buy_transactions', 
                                  'total_value_bought', 'total_shares_bought', 'total_shares_count',
-                                 'shares_traded_pct', 'close', 'return_7d']].head(10))
+                                 'shares_traded_pct', 'close', 'return_7td', 'excess_return_7td']].head(10))
 else:
     print("No matches found - please run the yfinance data fetching cell above")
 
+# Labels use excess return (market-adjusted): did the stock beat the market by 5%?
 threshold = 0.05
 
 if len(features_with_prices) > 0:
-    features_with_prices['label_7d'] = (features_with_prices['return_7d'] > threshold).astype(int)
+    # Drop rows where excess return is NaN (e.g. missing S&P 500 data for that date)
+    features_with_prices = features_with_prices[features_with_prices['excess_return_7td'].notna()].copy()
+    features_with_prices['label_7td'] = (features_with_prices['excess_return_7td'] > threshold).astype(int)
 
-    print(f"Labels created with {threshold:.1%} threshold")
-    print(f"\nLabel distribution (7-day):")
-    print(features_with_prices['label_7d'].value_counts())
-    print(f"Positive rate: {features_with_prices['label_7d'].mean():.2%}")
+    print(f"Labels created with {threshold:.1%} excess-return threshold (stock beats S&P 500 by 5%+)")
+    print(f"\nLabel distribution (7-trading-day excess return):")
+    print(features_with_prices['label_7td'].value_counts())
+    print(f"Positive rate: {features_with_prices['label_7td'].mean():.2%}")
 else:
     print("No features with prices - cannot create labels. Please run yfinance data fetching cell above.")
 
-transactions.to_csv('transactions_clean.csv', index=False)
-transactions_with_prices.to_csv('transactions_with_prices.csv', index=False)
-features.to_csv('features_ml_ready.csv', index=False)
-features_with_prices.to_csv('features_with_labels.csv', index=False)
-prices.to_csv('market_prices_clean.csv', index=False)
+transactions.to_csv('data/transactions_clean.csv', index=False)
+transactions_with_prices.to_csv('data/transactions_with_prices.csv', index=False)
+features.to_csv('data/features_ml_ready.csv', index=False)
+features_with_prices.to_csv('data/features_with_labels.csv', index=False)
+prices.to_csv('data/market_prices_clean.csv', index=False)
 
 print("="*80)
 print("DATA PREPARATION COMPLETE")
