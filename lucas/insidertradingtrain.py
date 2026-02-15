@@ -423,6 +423,8 @@ def _optimize_xgb_regression(X_train, y_train, X_val, y_val):
 # Stubs kept for compatibility (not used in current pipeline)
 # ---------------------------------------------------------------------------
 
+# TODO: ignore tickers, treat the dataset as a whole, sequence with X (7, 14, 21) days
+# and try LSTM
 def build_lstm_model():
     """Placeholder – LSTM is not suitable for this tabular dataset."""
     pass
