@@ -1,0 +1,24 @@
+# Large data files (exceed GitHub 100MB limit)
+market_prices_clean.csv
+
+# Optional: ignore other large outputs if you regenerate them
+# transactions_clean.csv
+# transactions_with_prices.csv
+# features_ml_ready.csv
+# features_with_labels.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.env
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
