@@ -1,0 +1,6 @@
+venv*
+lucas/data/market_prices_clean.csv
+.yfinance_cache
+lectures
+model
+__pycache__/
