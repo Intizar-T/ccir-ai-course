@@ -20,6 +20,16 @@ import joblib
 import warnings
 warnings.filterwarnings('ignore')
 
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
+# Optuna: number of trials per model (increase for better results, decrease for speed)
+N_OPTUNA_TRIALS = 50
+
 
 # ---------------------------------------------------------------------------
 # Data Loading
@@ -284,6 +294,132 @@ def xgboost_regression_model():
 
 
 # ---------------------------------------------------------------------------
+# Optuna hyperparameter optimization
+# ---------------------------------------------------------------------------
+
+def _optimize_rf_classification(X_train, y_train, X_val, y_val):
+    """Run Optuna study for Random Forest Classifier; return model trained with best params."""
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 600),
+            'max_depth': trial.suggest_int('max_depth', 4, 14),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 12),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 2, 10),
+            'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+            'class_weight': 'balanced',
+            'random_state': 42,
+            'n_jobs': -1,
+        }
+        clf = RandomForestClassifier(**params)
+        clf.fit(X_train, y_train)
+        y_proba = clf.predict_proba(X_val)[:, 1]
+        return roc_auc_score(y_val, y_proba)
+
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10))
+    study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
+    best = study.best_params
+    best['class_weight'] = 'balanced'
+    best['random_state'] = 42
+    best['n_jobs'] = -1
+    model = RandomForestClassifier(**best)
+    model.fit(X_train, y_train)
+    return model
+
+
+def _optimize_xgb_classification(X_train, y_train, X_val, y_val):
+    """Run Optuna study for XGBoost Classifier; return model trained with best params (early stopping on val)."""
+    scale_pos = max(1.0, (y_train == 0).sum() / max(1, (y_train == 1).sum()))
+
+    def objective(trial):
+        params = {
+            'n_estimators': 1500,
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 0.95),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.95),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 2.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 3.0),
+            'scale_pos_weight': scale_pos,
+            'eval_metric': 'logloss',
+            'random_state': 42,
+            'use_label_encoder': False,
+        }
+        clf = XGBClassifier(**params)
+        clf.set_params(early_stopping_rounds=80)
+        clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        y_proba = clf.predict_proba(X_val)[:, 1]
+        return roc_auc_score(y_val, y_proba)
+
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10))
+    study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
+    best = study.best_params
+    best['n_estimators'] = 1500
+    best['scale_pos_weight'] = scale_pos
+    best['eval_metric'] = 'logloss'
+    best['random_state'] = 42
+    best['use_label_encoder'] = False
+    model = XGBClassifier(**best)
+    model.set_params(early_stopping_rounds=80)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    return model
+
+
+def _optimize_rf_regression(X_train, y_train, X_val, y_val):
+    """Run Optuna study for Random Forest Regressor; return model trained with best params."""
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'max_depth': trial.suggest_int('max_depth', 4, 12),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 12),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 2, 10),
+            'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+            'random_state': 42,
+            'n_jobs': -1,
+        }
+        reg = RandomForestRegressor(**params)
+        reg.fit(X_train, y_train)
+        return r2_score(y_val, reg.predict(X_val))
+
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10))
+    study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
+    best = study.best_params
+    best['random_state'] = 42
+    best['n_jobs'] = -1
+    model = RandomForestRegressor(**best)
+    model.fit(X_train, y_train)
+    return model
+
+
+def _optimize_xgb_regression(X_train, y_train, X_val, y_val):
+    """Run Optuna study for XGBoost Regressor; return model trained with best params (early stopping on val)."""
+    def objective(trial):
+        params = {
+            'n_estimators': 1200,
+            'max_depth': trial.suggest_int('max_depth', 3, 9),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 0.95),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.95),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 2.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 3.0),
+            'random_state': 42,
+        }
+        reg = XGBRegressor(**params)
+        reg.set_params(early_stopping_rounds=80)
+        reg.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        return r2_score(y_val, reg.predict(X_val))
+
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10))
+    study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
+    best = study.best_params
+    best['n_estimators'] = 1200
+    best['random_state'] = 42
+    model = XGBRegressor(**best)
+    model.set_params(early_stopping_rounds=80)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    return model
+
+
+# ---------------------------------------------------------------------------
 # Stubs kept for compatibility (not used in current pipeline)
 # ---------------------------------------------------------------------------
 
@@ -418,6 +554,10 @@ def main():
     print("=" * 80)
     print("INSIDER TRADING ML TRAINING PIPELINE")
     print("=" * 80)
+    if OPTUNA_AVAILABLE:
+        print("Optuna: ON (hyperparameter tuning for Random Forest & XGBoost)")
+    else:
+        print("Optuna: not installed — using default hyperparameters (pip install optuna to enable tuning)")
 
     # 1. Load and process data
     df = process_data()
@@ -435,6 +575,7 @@ def main():
     print("CLASSIFICATION MODELS  (Predict label_7td: stock beats S&P 500 by >5%)")
     print("=" * 80)
 
+    # Classification: use Optuna for RF and XGBoost when available; else default models
     classification_models = {
         'Dummy (Baseline)': dummy_classification_model(),
         'Logistic Regression': logistic_regression_model(),
@@ -446,12 +587,27 @@ def main():
     results_class = {}
     for name, model in classification_models.items():
         print(f"\n--- {name} ---")
-        use_early_stop = 'XGBoost' in name
-        trained = train_model(
-            model, splits['X_train'], splits['y_class_train'],
-            eval_set=[(splits['X_val'], splits['y_class_val'])] if use_early_stop else None,
-            early_stopping_rounds=80 if use_early_stop else None,
-        )
+        use_optuna_rf = OPTUNA_AVAILABLE and name == 'Random Forest'
+        use_optuna_xgb = OPTUNA_AVAILABLE and name == 'XGBoost'
+        if use_optuna_rf:
+            print("  Optuna tuning (Random Forest)...")
+            trained = _optimize_rf_classification(
+                splits['X_train'], splits['y_class_train'],
+                splits['X_val'], splits['y_class_val'],
+            )
+        elif use_optuna_xgb:
+            print("  Optuna tuning (XGBoost)...")
+            trained = _optimize_xgb_classification(
+                splits['X_train'], splits['y_class_train'],
+                splits['X_val'], splits['y_class_val'],
+            )
+        else:
+            use_early_stop = 'XGBoost' in name
+            trained = train_model(
+                model, splits['X_train'], splits['y_class_train'],
+                eval_set=[(splits['X_val'], splits['y_class_val'])] if use_early_stop else None,
+                early_stopping_rounds=80 if use_early_stop else None,
+            )
         metrics = evaluate_model(trained, splits['X_test'], splits['y_class_test'],
                                  task='classification')
         results_class[name] = metrics
@@ -465,6 +621,7 @@ def main():
     print("REGRESSION MODELS  (Predict excess_return_7td)")
     print("=" * 80)
 
+    # Regression: use Optuna for RF and XGBoost when available; else default models
     regression_models = {
         'Dummy (Baseline)': dummy_regression_model(),
         'Ridge': ridge_regression_model(),
@@ -475,12 +632,27 @@ def main():
     results_reg = {}
     for name, model in regression_models.items():
         print(f"\n--- {name} ---")
-        use_early_stop = 'XGBoost' in name
-        trained = train_model(
-            model, splits['X_train'], splits['y_reg_train'],
-            eval_set=[(splits['X_val'], splits['y_reg_val'])] if use_early_stop else None,
-            early_stopping_rounds=80 if use_early_stop else None,
-        )
+        use_optuna_rf = OPTUNA_AVAILABLE and name == 'Random Forest Regressor'
+        use_optuna_xgb = OPTUNA_AVAILABLE and name == 'XGBoost Regressor'
+        if use_optuna_rf:
+            print("  Optuna tuning (Random Forest)...")
+            trained = _optimize_rf_regression(
+                splits['X_train'], splits['y_reg_train'],
+                splits['X_val'], splits['y_reg_val'],
+            )
+        elif use_optuna_xgb:
+            print("  Optuna tuning (XGBoost)...")
+            trained = _optimize_xgb_regression(
+                splits['X_train'], splits['y_reg_train'],
+                splits['X_val'], splits['y_reg_val'],
+            )
+        else:
+            use_early_stop = 'XGBoost' in name
+            trained = train_model(
+                model, splits['X_train'], splits['y_reg_train'],
+                eval_set=[(splits['X_val'], splits['y_reg_val'])] if use_early_stop else None,
+                early_stopping_rounds=80 if use_early_stop else None,
+            )
         metrics = evaluate_model(trained, splits['X_test'], splits['y_reg_test'],
                                  task='regression')
         results_reg[name] = metrics
