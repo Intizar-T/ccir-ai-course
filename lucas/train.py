@@ -2,22 +2,34 @@ import os
 import pandas as pd
 from sklearn.dummy import DummyRegressor
 
-def process_data():
+from create_dataset import create_dataset, InsiderTradingDataset
+
+
+def process_data(refetch: bool = False) -> pd.DataFrame:
     """
-    Loads the market regime data from CSV.
+    Return the insider-trading ML dataset (features_with_labels).
+
+    Args:
+        refetch: If True, always refetch market data and rebuild. If False and
+                 features_with_labels.csv exists, load from CSV and return.
+
+    Returns:
+        DataFrame with features and label_7td (saves CSVs when refetching).
     """
-    # Construct the path to the data file
-    # Assuming the data folder is in the same directory as this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(script_dir, 'data', 'features_with_labels.csv')
-    
-    # Load the data
-    df = pd.read_csv(file_path)
-    
-    # Convert Date column to datetime
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        
+    data_dir = os.path.join(script_dir, 'data')
+
+    ds: InsiderTradingDataset = create_dataset(
+        data_dir=data_dir,
+        refetch=refetch,
+        save_csv=True,
+        verbose=True,
+    )
+    df = ds.features_with_labels
+
+    if 'transaction_date' in df.columns:
+        df['transaction_date'] = pd.to_datetime(df['transaction_date'])
+
     return df
 
 def feature_engineering():
