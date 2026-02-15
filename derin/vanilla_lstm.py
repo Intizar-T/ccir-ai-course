@@ -3,20 +3,22 @@ Vanilla LSTM baseline for 21-day SPY return prediction.
 Uses past N trading days of features to predict cumulative return over the next 21 days.
 No target scaling (y in raw return space); X scaled with Robust/StandardScaler.
 Hyperopt (20 trials) maximizes validation R²; best model is retrained and evaluated on test.
-
-Device: Uses whatever Keras/TensorFlow sees (CPU or GPU). On Mac M1, use the
-project's venv-gpu (Python 3.11 + tensorflow-metal) for Metal GPU; the main
-venv (Python 3.13) has no tensorflow-metal wheel, so it runs on CPU only.
-Run with GPU:  source ../venv-gpu/bin/activate && python vanilla_lstm.py
 """
 import os
 import random
+
+# Force CPU for reliable, fast runs (Metal on M1 can be slower/stuck for small LSTMs).
+if os.environ.get("VANILLA_LSTM_CPU", "1").lower() in ("1", "true", "yes"):
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from keras.models import Sequential
 from keras.layers import LSTM, Dense, Dropout
+from keras.regularizers import L2
 from keras.callbacks import EarlyStopping
 from keras.optimizers import Adam
 from keras import backend as K
@@ -29,21 +31,6 @@ VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 SEED = 42
 HYPEROPT_TRIALS = 20
-
-
-def print_device_info():
-    """Print whether CPU or GPU (e.g. Metal on M1) is available for Keras/TF."""
-    try:
-        import tensorflow as tf
-        devices = tf.config.list_physical_devices()
-        gpus = [d for d in devices if 'GPU' in d.name]
-        print("Device(s) available:", [d.name for d in devices])
-        if gpus:
-            print("Using GPU (Metal on M1 if tensorflow-metal is installed).")
-        else:
-            print("Using CPU only. On Mac M1, install tensorflow-metal for GPU: pip install tensorflow-metal")
-    except Exception as e:
-        print("Could not detect devices:", e)
 
 
 def set_seed(seed=SEED):
@@ -109,8 +96,9 @@ def scale_and_split(df, feature_cols, input_window, scaler_class):
     return X_train, X_val, X_test, y_train, y_val, y_test, scaler_X
 
 
-def build_model(input_shape, lstm_units_1, lstm_units_2, dropout, lr):
-    """One or two LSTM layers; lstm_units_2=0 means single layer."""
+def build_model(input_shape, lstm_units_1, lstm_units_2, dropout, lr, l2):
+    """One or two LSTM layers; lstm_units_2=0 means single layer. L2 on Dense only."""
+    reg = L2(l2) if l2 > 0 else None
     model = Sequential()
     if lstm_units_2 is None or lstm_units_2 <= 0:
         model.add(LSTM(lstm_units_1, activation='relu', input_shape=input_shape, return_sequences=False))
@@ -119,7 +107,7 @@ def build_model(input_shape, lstm_units_1, lstm_units_2, dropout, lr):
         model.add(Dropout(dropout))
         model.add(LSTM(lstm_units_2, activation='relu', return_sequences=False))
     model.add(Dropout(dropout))
-    model.add(Dense(1))
+    model.add(Dense(1, kernel_regularizer=reg))
     model.compile(optimizer=Adam(learning_rate=lr), loss='mae')
     return model
 
@@ -132,7 +120,8 @@ def train_model(X_train, y_train, X_val, y_val, params, verbose=0):
         lstm_units_1=params['lstm_units_1'],
         lstm_units_2=params['lstm_units_2'] if params['lstm_units_2'] > 0 else None,
         dropout=params['dropout'],
-        lr=params['lr']
+        lr=params['lr'],
+        l2=params['l2']
     )
     early_stop = EarlyStopping(
         monitor='val_loss',
@@ -141,14 +130,18 @@ def train_model(X_train, y_train, X_val, y_val, params, verbose=0):
     )
     model.fit(
         X_train, y_train,
-        epochs=80,
+        epochs=60,
         batch_size=int(params['batch_size']),
         validation_data=(X_val, y_val),
         callbacks=[early_stop],
         verbose=verbose
     )
     val_pred = model.predict(X_val, verbose=0)
-    val_r2 = r2_score(np.ravel(y_val), np.ravel(val_pred))
+    y_v = np.ravel(y_val)
+    p_v = np.ravel(val_pred)
+    if not np.isfinite(p_v).all():
+        return model, -1.0
+    val_r2 = r2_score(y_v, p_v)
     return model, val_r2
 
 
@@ -158,10 +151,11 @@ def hyperopt_space():
         'scaler': hp.choice('scaler', ['robust', 'standard']),
         'lstm_units_1': hp.choice('lstm_units_1', [32, 64, 128]),
         'lstm_units_2': hp.choice('lstm_units_2', [0, 32, 64]),
-        'dropout': hp.uniform('dropout', 0.2, 0.45),
-        'lr': hp.loguniform('lr', np.log(1e-4), np.log(1e-1)),
+        'dropout': hp.uniform('dropout', 0.25, 0.5),
+        'l2': hp.loguniform('l2', np.log(1e-6), np.log(1e-2)),
+        'lr': hp.loguniform('lr', np.log(5e-4), np.log(5e-2)),
         'batch_size': hp.choice('batch_size', [16, 32, 64]),
-        'patience': hp.choice('patience', [5, 10, 15]),
+        'patience': hp.choice('patience', [8, 12, 15]),
     }
 
 
@@ -179,10 +173,12 @@ def objective(params):
         X_train, X_val, X_test, y_train, y_val, y_test, _ = scale_and_split(
             df, feature_cols, params['input_window'], scaler_class
         )
+        _, val_r2 = train_model(X_train, y_train, X_val, y_val, params, verbose=0)
+        if np.isfinite(val_r2):
+            return {'loss': -val_r2, 'status': STATUS_OK}
     except Exception:
-        return {'loss': 0.0, 'status': STATUS_OK}
-    _, val_r2 = train_model(X_train, y_train, X_val, y_val, params, verbose=0)
-    return {'loss': -val_r2, 'status': STATUS_OK}
+        pass
+    return {'loss': 0.0, 'status': STATUS_OK}
 
 
 def evaluate_and_print(model, X_test, y_test, y_train):
@@ -218,7 +214,6 @@ def evaluate_and_print(model, X_test, y_test, y_train):
 
 def main():
     set_seed(SEED)
-    print_device_info()
     print("Loading data...")
     df = process_data()
     print(f"Initial Shape: {df.shape}")
@@ -249,6 +244,7 @@ def main():
         'lstm_units_1': units_1[best['lstm_units_1']],
         'lstm_units_2': units_2[best['lstm_units_2']],
         'dropout': best['dropout'],
+        'l2': float(best['l2']),
         'lr': best['lr'],
         'batch_size': batch_sizes[best['batch_size']],
         'patience': patiences[best['patience']],
