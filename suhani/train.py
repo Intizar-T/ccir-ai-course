@@ -22,54 +22,52 @@ from keras import layers
 USE_IMPUTATION = True
 WINSORIZE_QUANTILE = 0.99
 TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10
-USE_RANDOM_SPLIT = False  # True: random split; False: time-aware (chronological) split
+USE_RANDOM_SPLIT = True  # True: random split; False: time-aware (chronological) split
 SPLIT_RANDOM_STATE = 42   # used when USE_RANDOM_SPLIT is True
 SCALER_TYPE = "standard"
 
 TIMESTAMP_COL = "Timestamp"
+DATE_COL = "Date"
 TARGET_COL = "Number of Admissions"
-FEATURE_COLS = [
-    "PM2.5 (µg/m³)",
-    "PM10 (µg/m³)",
-    "Index Value",
-    "temperature_2m_max (°C)",
-    "apparent_temperature_max (°C)",
-    "Ozone (µg/m³)",
-    "NO2 (µg/m³)",
-    "CO (mg/m³)",
-    "RH (%)",
-    "temperature_2m_min (°C)",
-]
-# Single feature set: raw features + admission lags + time (no rolling means).
+# Engineered features added in feature_engineering() (on top of dataset features).
 ADMISSION_LAGS_AND_TIME = [
     "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
     "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
 ]
-FEATURE_COLUMNS = FEATURE_COLS + ADMISSION_LAGS_AND_TIME
+
+
+def get_feature_columns(df):
+    """All numeric dataset columns (except timestamp/date and target) + ADMISSION_LAGS_AND_TIME."""
+    exclude = (TARGET_COL, DATE_COL)
+    dataset_features = [
+        c for c in df.columns
+        if c not in exclude and c not in ADMISSION_LAGS_AND_TIME and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    engineered = [c for c in ADMISSION_LAGS_AND_TIME if c in df.columns]
+    return dataset_features + engineered
 
 
 def load_data():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(script_dir, "data", "merged_data.csv")
     df = pd.read_csv(path)
-    cols = [TIMESTAMP_COL] + [c for c in FEATURE_COLS if c in df.columns] + [TARGET_COL]
-    df = df[[c for c in cols if c in df.columns]].copy()
     if TIMESTAMP_COL in df.columns:
-        df["Date"] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
+        df[DATE_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
         df = df.drop(columns=[TIMESTAMP_COL])
     return df
 
 
 def preprocess_data(df, impute_features=False):
-    df = df.sort_values("Date").copy()
+    df = df.sort_values(DATE_COL).copy()
     df = df.dropna(subset=[TARGET_COL])
+    feature_cols = get_feature_columns(df)
     if impute_features:
-        for col in FEATURE_COLS:
+        for col in feature_cols:
             if col in df.columns and df[col].isna().any():
                 df[col] = df[col].ffill().bfill()
-        df = df.dropna(subset=[c for c in FEATURE_COLS if c in df.columns])
+        df = df.dropna(subset=[c for c in feature_cols if c in df.columns])
     else:
-        df = df.dropna(subset=[c for c in FEATURE_COLS if c in df.columns])
+        df = df.dropna(subset=[c for c in feature_cols if c in df.columns])
     q = df[TARGET_COL].quantile(WINSORIZE_QUANTILE)
     df.loc[df[TARGET_COL] > q, TARGET_COL] = q
     return df.reset_index(drop=True)
@@ -77,8 +75,8 @@ def preprocess_data(df, impute_features=False):
 
 def feature_engineering(df):
     """Add admission lags and time features only (no rolling means)."""
-    df = df.sort_values("Date").reset_index(drop=True)
-    dt = pd.to_datetime(df["Date"])
+    df = df.sort_values(DATE_COL).reset_index(drop=True)
+    dt = pd.to_datetime(df[DATE_COL])
     df["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
@@ -89,11 +87,6 @@ def feature_engineering(df):
     adm_cols = [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
     df = df.dropna(how="any", subset=adm_cols)
     return df.reset_index(drop=True)
-
-
-def get_feature_columns():
-    """Columns used by all models (single feature set)."""
-    return FEATURE_COLUMNS
 
 
 def _time_aware_split_indices(n, train_frac, val_frac, test_frac):
@@ -126,7 +119,7 @@ def training_data_split(df, train_frac=None, val_frac=None, test_frac=None, use_
     test_frac = test_frac if test_frac is not None else TEST_FRAC
     use_random = use_random_split if use_random_split is not None else USE_RANDOM_SPLIT
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-9
-    feat_cols = [c for c in get_feature_columns() if c in df.columns]
+    feat_cols = [c for c in get_feature_columns(df) if c in df.columns]
     if not feat_cols:
         raise ValueError("No feature columns found in df.")
     X = df[feat_cols].astype(float)
@@ -189,8 +182,7 @@ class RidgeReduced:
         self._cols = None
 
     def fit(self, X, y):
-        self._cols = [c for c in get_feature_columns() if c in X.columns]
-        self._cols = self._cols or X.columns.tolist()[:10]
+        self._cols = X.columns.tolist()
         self._model.fit(X[self._cols], y)
         return self
 
