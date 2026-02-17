@@ -25,8 +25,6 @@ TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10
 USE_RANDOM_SPLIT = False  # True: random split; False: time-aware (chronological) split
 SPLIT_RANDOM_STATE = 42   # used when USE_RANDOM_SPLIT is True
 SCALER_TYPE = "standard"
-# Feature set for all models: "reduced" (13 cols) or "all" (full engineered features). All columns are always built; this only selects which are used.
-FEATURE_SET = "all"
 
 TIMESTAMP_COL = "Timestamp"
 TARGET_COL = "Number of Admissions"
@@ -42,21 +40,12 @@ FEATURE_COLS = [
     "RH (%)",
     "temperature_2m_min (°C)",
 ]
-REDUCED_FEATURES = [
-    "admissions_lag1", 
-    "admissions_lag3", 
-    "admissions_lag7", 
-    "admissions_lag14",
-    "PM2.5 (µg/m³)_roll7",
-    "PM2.5 (µg/m³)_roll14",
-    "PM10 (µg/m³)_roll7",
-    "Index Value_roll7",
-    "dow_sin",
-    "dow_cos",
-    "month_sin",
-    "month_cos",
-    "weekend",
+# Single feature set: raw features + admission lags + time (no rolling means).
+ADMISSION_LAGS_AND_TIME = [
+    "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
+    "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
 ]
+FEATURE_COLUMNS = FEATURE_COLS + ADMISSION_LAGS_AND_TIME
 
 
 def load_data():
@@ -87,59 +76,24 @@ def preprocess_data(df, impute_features=False):
 
 
 def feature_engineering(df):
+    """Add admission lags and time features only (no rolling means)."""
     df = df.sort_values("Date").reset_index(drop=True)
-    base_cols = [c for c in FEATURE_COLS if c in df.columns]
-    if "PM2.5 (µg/m³)" in df.columns and "PM10 (µg/m³)" in df.columns:
-        pm25, pm10 = df["PM2.5 (µg/m³)"], df["PM10 (µg/m³)"]
-        df["PM_ratio"] = np.where(pm10 > 0, pm25 / pm10, np.nan)
-        df["PM_ratio"] = df["PM_ratio"].fillna(df["PM_ratio"].median())
-        base_cols = base_cols + ["PM_ratio"]
-    tmax, tmin = "temperature_2m_max (°C)", "temperature_2m_min (°C)"
-    if tmax in df.columns and tmin in df.columns:
-        df["temp_range"] = df[tmax] - df[tmin]
-    for col in base_cols:
-        for lag in (1, 3, 7, 14):
-            df[f"{col}_lag{lag}"] = df[col].shift(lag)
-    for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
-        for w in (3, 7, 14):
-            df[f"{col}_roll{w}"] = df[col].rolling(w, min_periods=1).mean()
-            if w >= 7:
-                df[f"{col}_roll{w}_std"] = df[col].rolling(w, min_periods=1).std().fillna(0)
-    for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
-        r7 = df[col].rolling(7, min_periods=1).mean()
-        df[f"{col}_trend7"] = r7.diff().fillna(0)
     dt = pd.to_datetime(df["Date"])
     df["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
     df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
     df["weekend"] = (dt.dt.dayofweek >= 5).astype(np.float64)
-    df["day_of_year_sin"] = np.sin(2 * np.pi * dt.dt.dayofyear / 365.25)
-    df["day_of_year_cos"] = np.cos(2 * np.pi * dt.dt.dayofyear / 365.25)
     for lag in (1, 3, 7, 14):
         df[f"admissions_lag{lag}"] = df[TARGET_COL].shift(lag)
-    lag_cols = [f"{c}_lag{lag}" for c in base_cols for lag in (1, 3, 7, 14)]
-    lag_cols += [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
-    lag_cols = [c for c in lag_cols if c in df.columns]
-    df = df.dropna(how="any", subset=lag_cols)
+    adm_cols = [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
+    df = df.dropna(how="any", subset=adm_cols)
     return df.reset_index(drop=True)
 
 
-def _all_feature_columns():
-    """Full set: base + lags + rolls + time + roll_std + trends + day_of_year."""
-    base = [c for c in FEATURE_COLS] + ["PM_ratio", "temp_range"]
-    lags = [f"{c}_lag{lag}" for c in base for lag in (1, 3, 7, 14)]
-    lags += [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
-    rolls = [f"{r}_roll{w}" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (3, 7, 14)]
-    time_ = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
-    rolls_std = [f"{r}_roll{w}_std" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (7, 14)]
-    trends = [f"{r}_trend7" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value")]
-    return base + lags + rolls + time_ + rolls_std + trends + ["day_of_year_sin", "day_of_year_cos"]
-
-
 def get_feature_columns():
-    """Columns used by all models; controlled by FEATURE_SET."""
-    return REDUCED_FEATURES if FEATURE_SET == "reduced" else _all_feature_columns()
+    """Columns used by all models (single feature set)."""
+    return FEATURE_COLUMNS
 
 
 def _time_aware_split_indices(n, train_frac, val_frac, test_frac):
@@ -229,7 +183,7 @@ def elastic_net_cv_model(cv=5):
 
 
 class RidgeReduced:
-    """Ridge on the same feature set as all models (FEATURE_SET)."""
+    """Ridge on the same feature set as all models."""
     def __init__(self):
         self._model = RidgeCV(alphas=np.logspace(-2, 2, 50), cv=5)
         self._cols = None
@@ -366,7 +320,7 @@ def main():
 
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
-    print(f"  Features: {FEATURE_SET} ({X_train.shape[1]} cols)")
+    print(f"  Features: {X_train.shape[1]} cols")
     print(f"  Split: {'random' if USE_RANDOM_SPLIT else 'time-aware (chronological)'}")
     print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
 

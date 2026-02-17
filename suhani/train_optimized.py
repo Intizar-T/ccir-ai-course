@@ -18,10 +18,9 @@ import tensorflow as tf
 from tensorflow import keras
 from keras import layers
 
-# Reuse data pipeline and config from train (all models use same feature set via FEATURE_SET)
+# Reuse data pipeline and config from train (single feature set)
 from train import (
     USE_IMPUTATION,
-    FEATURE_SET,
     load_data,
     preprocess_data,
     feature_engineering,
@@ -245,7 +244,7 @@ def main():
 
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
-    print(f"  Features: {FEATURE_SET} ({X_train.shape[1]} cols)")
+    print(f"  Features: {X_train.shape[1]} cols")
     print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
     print(f"Optuna: {N_TRIALS} trials per tunable model.\n")
 
