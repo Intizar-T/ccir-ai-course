@@ -16,13 +16,12 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from keras import layers
 
 # Reuse data pipeline and config from train (all models use same feature set via FEATURE_SET)
 from train import (
     USE_IMPUTATION,
     FEATURE_SET,
-    TARGET_COL,
     load_data,
     preprocess_data,
     feature_engineering,

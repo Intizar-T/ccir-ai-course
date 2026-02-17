@@ -26,14 +26,36 @@ USE_RANDOM_SPLIT = False  # True: random split; False: time-aware (chronological
 SPLIT_RANDOM_STATE = 42   # used when USE_RANDOM_SPLIT is True
 SCALER_TYPE = "standard"
 # Feature set for all models: "reduced" (13 cols) or "all" (full engineered features). All columns are always built; this only selects which are used.
-FEATURE_SET = "reduced"
+FEATURE_SET = "all"
 
 TIMESTAMP_COL = "Timestamp"
 TARGET_COL = "Number of Admissions"
 FEATURE_COLS = [
-    "PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value", "temperature_2m_max (°C)",
-    "apparent_temperature_max (°C)", "Ozone (µg/m³)", "NO2 (µg/m³)", "CO (mg/m³)",
-    "RH (%)", "temperature_2m_min (°C)",
+    "PM2.5 (µg/m³)",
+    "PM10 (µg/m³)",
+    "Index Value",
+    "temperature_2m_max (°C)",
+    "apparent_temperature_max (°C)",
+    "Ozone (µg/m³)",
+    "NO2 (µg/m³)",
+    "CO (mg/m³)",
+    "RH (%)",
+    "temperature_2m_min (°C)",
+]
+REDUCED_FEATURES = [
+    "admissions_lag1", 
+    "admissions_lag3", 
+    "admissions_lag7", 
+    "admissions_lag14",
+    "PM2.5 (µg/m³)_roll7",
+    "PM2.5 (µg/m³)_roll14",
+    "PM10 (µg/m³)_roll7",
+    "Index Value_roll7",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "weekend",
 ]
 
 
@@ -101,14 +123,6 @@ def feature_engineering(df):
     lag_cols = [c for c in lag_cols if c in df.columns]
     df = df.dropna(how="any", subset=lag_cols)
     return df.reset_index(drop=True)
-
-
-# Feature sets: one source of truth. All models use get_feature_columns().
-REDUCED_FEATURES = [
-    "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
-    "PM2.5 (µg/m³)_roll7", "PM2.5 (µg/m³)_roll14", "PM10 (µg/m³)_roll7", "Index Value_roll7",
-    "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
-]
 
 
 def _all_feature_columns():
