@@ -1,338 +1,238 @@
-# Converted from Models.ipynb
+"""
+Admission prediction models: FNN, SVR, Dummy, Linear Regression, XGBoost, Random Forest.
+Supports random and time-aware train/test splits.
+"""
 
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.neural_network import MLPClassifier   # use MLPRegressor if regression
-from sklearn.metrics import accuracy_score, classification_report
 import pandas as pd
-
-all_features_data = pd.read_csv("/Users/suhaniagarwal/Downloads/all_features_data.csv")
-
-import numpy as np
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
+from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-
-
-y_fnn_rand = all_features_data["Number of Admissions"]
-
-X_fnn_rand = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-
-X_train_fnn_rand, X_test_fnn_rand, y_train_fnn_rand, y_test_fnn_rand = train_test_split(
-    X_fnn_rand,
-    y_fnn_rand,
-    test_size=0.2,
-    random_state=42,
-    shuffle=True
-)
-
-
-fnn_rand = Pipeline([
-    ("scaler", StandardScaler()),
-    ("fnn", MLPRegressor(
-        hidden_layer_sizes=(64, 32),
-        activation="relu",
-        solver="adam",
-        alpha=1e-4,
-        learning_rate_init=0.001,
-        max_iter=1000,
-        early_stopping=True,
-        random_state=42
-    ))
-])
-
-
-fnn_rand.fit(X_train_fnn_rand, y_train_fnn_rand)
-y_pred_fnn_rand = fnn_rand.predict(X_test_fnn_rand)
-
-print("FNN (Random Split)")
-print("R²   :", r2_score(y_test_fnn_rand, y_pred_fnn_rand))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_fnn_rand, y_pred_fnn_rand)))
-print("MAE :", mean_absolute_error(y_test_fnn_rand, y_pred_fnn_rand))
-
-import numpy as np
 from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-
-
-y_fnn_time = all_features_data["Number of Admissions"]
-
-X_fnn_time = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-
-split_date = "2018-11-01"
-
-train_idx = all_features_data["Timestamp"] < split_date
-test_idx  = all_features_data["Timestamp"] >= split_date
-
-X_train_fnn_time = X_fnn_time.loc[train_idx]
-X_test_fnn_time  = X_fnn_time.loc[test_idx]
-
-y_train_fnn_time = y_fnn_time.loc[train_idx]
-y_test_fnn_time  = y_fnn_time.loc[test_idx]
-
-fnn_time = Pipeline([
-    ("scaler", StandardScaler()),
-    ("fnn", MLPRegressor(
-        hidden_layer_sizes=(64, 32),
-        activation="relu",
-        solver="adam",
-        alpha=1e-4,
-        learning_rate_init=0.001,
-        max_iter=1000,
-        early_stopping=True,
-        random_state=42
-    ))
-])
-
-
-fnn_time.fit(X_train_fnn_time, y_train_fnn_time)
-y_pred_fnn_time = fnn_time.predict(X_test_fnn_time)
-
-print("FNN (Time-Aware Split)")
-print("R²   :", r2_score(y_test_fnn_time, y_pred_fnn_time))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_fnn_time, y_pred_fnn_time)))
-print("MAE :", mean_absolute_error(y_test_fnn_time, y_pred_fnn_time))
-
-import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-
-
-y_svr = all_features_data["Number of Admissions"]
-
-X_svr = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-X_train_svr, X_test_svr, y_train_svr, y_test_svr = train_test_split(
-    X_svr, y_svr, test_size=0.2, random_state=42, shuffle=True
-)
-
-
-svr_pipeline = Pipeline([
-    ("scaler", StandardScaler()),
-    ("svr", SVR(kernel="rbf", C=10, epsilon=0.1))
-])
-
-svr_pipeline.fit(X_train_svr, y_train_svr)
-
-y_pred_svr = svr_pipeline.predict(X_test_svr)
-
-print("SVR (Random Split)")
-print("R²   :", r2_score(y_test_svr, y_pred_svr))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_svr, y_pred_svr)))
-print("MAE :", mean_absolute_error(y_test_svr, y_pred_svr))
-
-from sklearn.dummy import DummyRegressor
-
-
-y_dummy = all_features_data["Number of Admissions"]
-
-X_dummy = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-X_train_dummy, X_test_dummy, y_train_dummy, y_test_dummy = train_test_split(
-    X_dummy, y_dummy, test_size=0.2, random_state=42, shuffle=True
-)
-
-
-dummy_reg = DummyRegressor(strategy="mean")
-dummy_reg.fit(X_train_dummy, y_train_dummy)
-
-y_pred_dummy = dummy_reg.predict(X_test_dummy)
-
-print("Dummy Regressor (Random Split)")
-print("R²   :", r2_score(y_test_dummy, y_pred_dummy))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_dummy, y_pred_dummy)))
-print("MAE :", mean_absolute_error(y_test_dummy, y_pred_dummy))
-
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-
-
-y_lin = all_features_data["Number of Admissions"]
-
-X_lin = all_features_data.drop(
-    columns=[
-        "Number of Admissions",
-        "Timestamp"
-    ]
-)
-
-
-X_train_lin, X_test_lin, y_train_lin, y_test_lin = train_test_split(
-    X_lin,
-    y_lin,
-    test_size=0.2,
-    random_state=42,
-    shuffle=True
-)
-
-
-lin_pipeline = Pipeline([
-    ("scaler", StandardScaler()),
-    ("linreg", LinearRegression())
-])
-
-
-lin_pipeline.fit(X_train_lin, y_train_lin)
-
-
-y_pred_lin = lin_pipeline.predict(X_test_lin)
-
-print("Linear Regression (Random Split)")
-print("--------------------------------")
-print("R²   :", r2_score(y_test_lin, y_pred_lin))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_lin, y_pred_lin)))
-print("MAE :", mean_absolute_error(y_test_lin, y_pred_lin))
-
-import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+TARGET_COL = "Number of Admissions"
+DROP_COLS = ["Number of Admissions", "Timestamp"]
+SPLIT_DATE = "2018-11-01"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
 
 
-y_xgb_rand = all_features_data["Number of Admissions"]
-
-X_xgb_rand = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-X_train_xgb_rand, X_test_xgb_rand, y_train_xgb_rand, y_test_xgb_rand = train_test_split(
-    X_xgb_rand, y_xgb_rand, test_size=0.2, random_state=42, shuffle=True
-)
+def load_data(data_path: str) -> pd.DataFrame:
+    """Load feature matrix from CSV."""
+    return pd.read_csv(data_path)
 
 
-xgb_rand = xgb.XGBRegressor(
-    n_estimators=300,
-    max_depth=4,
-    learning_rate=0.05,
-    subsample=0.85,
-    colsample_bytree=0.85,
-    objective="reg:squarederror",
-    random_state=42
-)
-
-xgb_rand.fit(X_train_xgb_rand, y_train_xgb_rand)
-y_pred_xgb_rand = xgb_rand.predict(X_test_xgb_rand)
-
-print("XGBoost (Random Split)")
-print("R²   :", r2_score(y_test_xgb_rand, y_pred_xgb_rand))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_xgb_rand, y_pred_xgb_rand)))
-print("MAE :", mean_absolute_error(y_test_xgb_rand, y_pred_xgb_rand))
+def prepare_X_y(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Extract feature matrix X and target y."""
+    y = df[TARGET_COL]
+    X = df.drop(columns=DROP_COLS)
+    return X, y
 
 
-y_xgb_time = all_features_data["Number of Admissions"]
-
-X_xgb_time = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-split_date = "2018-11-01"
-
-train_idx = all_features_data["Timestamp"] < split_date
-test_idx  = all_features_data["Timestamp"] >= split_date
-
-X_train_xgb_time = X_xgb_time.loc[train_idx]
-X_test_xgb_time  = X_xgb_time.loc[test_idx]
-
-y_train_xgb_time = y_xgb_time.loc[train_idx]
-y_test_xgb_time  = y_xgb_time.loc[test_idx]
+def split_random(
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = TEST_SIZE,
+    random_state: int = RANDOM_STATE,
+) -> tuple:
+    """Random train/test split."""
+    return train_test_split(
+        X, y, test_size=test_size, random_state=random_state, shuffle=True
+    )
 
 
-xgb_time = xgb.XGBRegressor(
-    n_estimators=300,
-    max_depth=4,
-    learning_rate=0.05,
-    subsample=0.85,
-    colsample_bytree=0.85,
-    objective="reg:squarederror",
-    random_state=42
-)
-
-xgb_time.fit(X_train_xgb_time, y_train_xgb_time)
-y_pred_xgb_time = xgb_time.predict(X_test_xgb_time)
-
-print("XGBoost (Time-Aware Split)")
-print("R²   :", r2_score(y_test_xgb_time, y_pred_xgb_time))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_xgb_time, y_pred_xgb_time)))
-print("MAE :", mean_absolute_error(y_test_xgb_time, y_pred_xgb_time))
-
-from sklearn.ensemble import RandomForestRegressor
+def split_time_aware(
+    df: pd.DataFrame,
+    X: pd.DataFrame,
+    y: pd.Series,
+    date_col: str = "Timestamp",
+    split_date: str = SPLIT_DATE,
+) -> tuple:
+    """Time-aware train/test split: train before split_date, test on or after."""
+    train_mask = df[date_col] < split_date
+    test_mask = df[date_col] >= split_date
+    return (
+        X.loc[train_mask],
+        X.loc[test_mask],
+        y.loc[train_mask],
+        y.loc[test_mask],
+    )
 
 
-y_rf_rand = all_features_data["Number of Admissions"]
-
-X_rf_rand = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
-
-X_train_rf_rand, X_test_rf_rand, y_train_rf_rand, y_test_rf_rand = train_test_split(
-    X_rf_rand, y_rf_rand, test_size=0.2, random_state=42, shuffle=True
-)
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Compute R², RMSE, MAE."""
+    return {
+        "r2": r2_score(y_true, y_pred),
+        "rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "mae": mean_absolute_error(y_true, y_pred),
+    }
 
 
-rf_rand = RandomForestRegressor(
-    n_estimators=300,
-    max_depth=None,
-    min_samples_leaf=5,
-    random_state=42,
-    n_jobs=-1
-)
-
-rf_rand.fit(X_train_rf_rand, y_train_rf_rand)
-y_pred_rf_rand = rf_rand.predict(X_test_rf_rand)
-
-print("Random Forest (Random Split)")
-print("R²   :", r2_score(y_test_rf_rand, y_pred_rf_rand))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_rf_rand, y_pred_rf_rand)))
-print("MAE :", mean_absolute_error(y_test_rf_rand, y_pred_rf_rand))
+def print_metrics(metrics: dict, model_name: str) -> None:
+    """Print regression metrics with a label."""
+    print(f"{model_name}")
+    print("R²   :", metrics["r2"])
+    print("RMSE :", metrics["rmse"])
+    print("MAE  :", metrics["mae"])
+    print()
 
 
-y_rf_time = all_features_data["Number of Admissions"]
+def train_and_evaluate(
+    model,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    name: str,
+) -> dict:
+    """Fit model, predict on test set, print and return metrics."""
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    metrics = regression_metrics(y_test.values, y_pred)
+    print_metrics(metrics, name)
+    return metrics
 
-X_rf_time = all_features_data.drop(
-    columns=["Number of Admissions", "Timestamp"]
-)
 
-X_train_rf_time = X_rf_time.loc[train_idx]
-X_test_rf_time  = X_rf_time.loc[test_idx]
+# ---------------------------------------------------------------------------
+# Model builders (same hyperparameters as original notebook)
+# ---------------------------------------------------------------------------
+def build_fnn_pipeline() -> Pipeline:
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        (
+            "fnn",
+            MLPRegressor(
+                hidden_layer_sizes=(64, 32),
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                learning_rate_init=0.001,
+                max_iter=1000,
+                early_stopping=True,
+                random_state=RANDOM_STATE,
+            ),
+        ),
+    ])
 
-y_train_rf_time = y_rf_time.loc[train_idx]
-y_test_rf_time  = y_rf_time.loc[test_idx]
+
+def build_svr_pipeline() -> Pipeline:
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("svr", SVR(kernel="rbf", C=10, epsilon=0.1)),
+    ])
 
 
-rf_time = RandomForestRegressor(
-    n_estimators=300,
-    max_depth=None,
-    min_samples_leaf=5,
-    random_state=42,
-    n_jobs=-1
-)
+def build_linear_pipeline() -> Pipeline:
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("linreg", LinearRegression()),
+    ])
 
-rf_time.fit(X_train_rf_time, y_train_rf_time)
-y_pred_rf_time = rf_time.predict(X_test_rf_time)
 
-print("Random Forest (Time-Aware Split)")
-print("R²   :", r2_score(y_test_rf_time, y_pred_rf_time))
-print("RMSE:", np.sqrt(mean_squared_error(y_test_rf_time, y_pred_rf_time)))
-print("MAE :", mean_absolute_error(y_test_rf_time, y_pred_rf_time))
+def build_xgb_regressor():
+    return xgb.XGBRegressor(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        objective="reg:squarederror",
+        random_state=RANDOM_STATE,
+    )
+
+
+def build_rf_regressor():
+    return RandomForestRegressor(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=5,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main: load data, run all experiments
+# ---------------------------------------------------------------------------
+def run_all_models(
+    data_path: str = "data/all_features_data.csv",
+) -> None:
+    """Load data and run all regression models with random and time-aware splits."""
+    df = load_data(data_path)
+    X, y = prepare_X_y(df)
+
+    # Random split (shared for models that use it)
+    X_train_r, X_test_r, y_train_r, y_test_r = split_random(X, y)
+
+    # Time-aware split
+    X_train_t, X_test_t, y_train_t, y_test_t = split_time_aware(df, X, y)
+
+    # ---- FNN ----
+    train_and_evaluate(
+        build_fnn_pipeline(),
+        X_train_r, y_train_r, X_test_r, y_test_r,
+        "FNN (Random Split)",
+    )
+    train_and_evaluate(
+        build_fnn_pipeline(),
+        X_train_t, y_train_t, X_test_t, y_test_t,
+        "FNN (Time-Aware Split)",
+    )
+
+    # ---- SVR ----
+    train_and_evaluate(
+        build_svr_pipeline(),
+        X_train_r, y_train_r, X_test_r, y_test_r,
+        "SVR (Random Split)",
+    )
+
+    # ---- Dummy ----
+    train_and_evaluate(
+        DummyRegressor(strategy="mean"),
+        X_train_r, y_train_r, X_test_r, y_test_r,
+        "Dummy Regressor (Random Split)",
+    )
+
+    # ---- Linear Regression ----
+    train_and_evaluate(
+        build_linear_pipeline(),
+        X_train_r, y_train_r, X_test_r, y_test_r,
+        "Linear Regression (Random Split)",
+    )
+
+    # ---- XGBoost ----
+    train_and_evaluate(
+        build_xgb_regressor(),
+        X_train_r, y_train_r, X_test_r, y_test_r,
+        "XGBoost (Random Split)",
+    )
+    train_and_evaluate(
+        build_xgb_regressor(),
+        X_train_t, y_train_t, X_test_t, y_test_t,
+        "XGBoost (Time-Aware Split)",
+    )
+
+    # ---- Random Forest ----
+    train_and_evaluate(
+        build_rf_regressor(),
+        X_train_r, y_train_r, X_test_r, y_test_r,
+        "Random Forest (Random Split)",
+    )
+    train_and_evaluate(
+        build_rf_regressor(),
+        X_train_t, y_train_t, X_test_t, y_test_t,
+        "Random Forest (Time-Aware Split)",
+    )
+
+
+if __name__ == "__main__":
+    run_all_models()

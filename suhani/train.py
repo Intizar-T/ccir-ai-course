@@ -1,67 +1,43 @@
 """
 Predict Number of Admissions from air quality and weather (merged_data.csv).
-
-Pipeline: load → preprocess (impute/drop missing, winsorize) → feature engineering
-(lags, rolling means, cyclical time) → time-ordered train/val/test split → scale features
-→ train multiple regression models → report comparison table and best model by Test R².
+Pipeline: load → preprocess → feature engineering → train/val/test split (time-aware or random, see USE_RANDOM_SPLIT)
+→ train models → report comparison and best by Test R².
 """
 
 import os
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import ElasticNetCV, Ridge, RidgeCV
+from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.svm import SVR
-
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+from keras import layers
 
-try:
-    import xgboost as xgb
-    HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
-
-
-# ---------------------------------------------------------------------------
-# Configuration (tweak for experiments)
-# ---------------------------------------------------------------------------
-
-USE_IMPUTATION = True  # If True, impute missing features (ffill/bfill); else drop rows
-WINSORIZE_QUANTILE = 0.99  # 0.99 = 99th percentile; try 0.95 for less clipping
-TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10  # time-ordered split
-USE_EXTRA_FEATURES = True  # day_of_year, rolling_std, trend (diff of roll7)
-SCALER_TYPE = "standard"  # "standard" | "robust"
-KERAS_TRIALS = 50
+USE_IMPUTATION = True
+WINSORIZE_QUANTILE = 0.99
+TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10
+USE_RANDOM_SPLIT = False  # True: random split; False: time-aware (chronological) split
+SPLIT_RANDOM_STATE = 42   # used when USE_RANDOM_SPLIT is True
+SCALER_TYPE = "standard"
+# Feature set for all models: "reduced" (13 cols) or "all" (full engineered features). All columns are always built; this only selects which are used.
+FEATURE_SET = "reduced"
 
 TIMESTAMP_COL = "Timestamp"
 TARGET_COL = "Number of Admissions"
 FEATURE_COLS = [
-    "PM2.5 (µg/m³)",
-    "PM10 (µg/m³)",
-    "Index Value",
-    "temperature_2m_max (°C)",
-    "apparent_temperature_max (°C)",
-    "Ozone (µg/m³)",
-    "NO2 (µg/m³)",
-    "CO (mg/m³)",
-    "RH (%)",
-    "temperature_2m_min (°C)",
+    "PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value", "temperature_2m_max (°C)",
+    "apparent_temperature_max (°C)", "Ozone (µg/m³)", "NO2 (µg/m³)", "CO (mg/m³)",
+    "RH (%)", "temperature_2m_min (°C)",
 ]
 
 
-# ---------------------------------------------------------------------------
-# Load & preprocess
-# ---------------------------------------------------------------------------
-
 def load_data():
-    """Load CSV, keep timestamp + feature columns + target, parse date."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(script_dir, "data", "merged_data.csv")
     df = pd.read_csv(path)
@@ -74,7 +50,6 @@ def load_data():
 
 
 def preprocess_data(df, impute_features=False):
-    """Drop rows with missing target; optionally impute or drop missing features. Winsorize target at 99th percentile."""
     df = df.sort_values("Date").copy()
     df = df.dropna(subset=[TARGET_COL])
     if impute_features:
@@ -89,52 +64,38 @@ def preprocess_data(df, impute_features=False):
     return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Feature engineering
-# ---------------------------------------------------------------------------
-
 def feature_engineering(df):
-    """Add PM ratio, temp range, 1/3/7/14-day lags, 3/7/14-day rolling means, cyclical time, weekend. Drop rows with NaN from lags."""
     df = df.sort_values("Date").reset_index(drop=True)
     base_cols = [c for c in FEATURE_COLS if c in df.columns]
-
     if "PM2.5 (µg/m³)" in df.columns and "PM10 (µg/m³)" in df.columns:
         pm25, pm10 = df["PM2.5 (µg/m³)"], df["PM10 (µg/m³)"]
         df["PM_ratio"] = np.where(pm10 > 0, pm25 / pm10, np.nan)
         df["PM_ratio"] = df["PM_ratio"].fillna(df["PM_ratio"].median())
         base_cols = base_cols + ["PM_ratio"]
-
     tmax, tmin = "temperature_2m_max (°C)", "temperature_2m_min (°C)"
     if tmax in df.columns and tmin in df.columns:
         df["temp_range"] = df[tmax] - df[tmin]
-
     for col in base_cols:
         for lag in (1, 3, 7, 14):
             df[f"{col}_lag{lag}"] = df[col].shift(lag)
-
     for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
         for w in (3, 7, 14):
             df[f"{col}_roll{w}"] = df[col].rolling(w, min_periods=1).mean()
-            if USE_EXTRA_FEATURES and w >= 7:
+            if w >= 7:
                 df[f"{col}_roll{w}_std"] = df[col].rolling(w, min_periods=1).std().fillna(0)
-
-    if USE_EXTRA_FEATURES:
-        for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
-            r7 = df[col].rolling(7, min_periods=1).mean()
-            df[f"{col}_trend7"] = r7.diff().fillna(0)
+    for col in [c for c in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") if c in df.columns]:
+        r7 = df[col].rolling(7, min_periods=1).mean()
+        df[f"{col}_trend7"] = r7.diff().fillna(0)
     dt = pd.to_datetime(df["Date"])
     df["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
     df["dow_cos"] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
     df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
     df["weekend"] = (dt.dt.dayofweek >= 5).astype(np.float64)
-    if USE_EXTRA_FEATURES:
-        df["day_of_year_sin"] = np.sin(2 * np.pi * dt.dt.dayofyear / 365.25)
-        df["day_of_year_cos"] = np.cos(2 * np.pi * dt.dt.dayofyear / 365.25)
-
+    df["day_of_year_sin"] = np.sin(2 * np.pi * dt.dt.dayofyear / 365.25)
+    df["day_of_year_cos"] = np.cos(2 * np.pi * dt.dt.dayofyear / 365.25)
     for lag in (1, 3, 7, 14):
         df[f"admissions_lag{lag}"] = df[TARGET_COL].shift(lag)
-
     lag_cols = [f"{c}_lag{lag}" for c in base_cols for lag in (1, 3, 7, 14)]
     lag_cols += [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
     lag_cols = [c for c in lag_cols if c in df.columns]
@@ -142,39 +103,60 @@ def feature_engineering(df):
     return df.reset_index(drop=True)
 
 
-def get_feature_columns():
-    """List of feature column names (only those present in df are used in split)."""
+# Feature sets: one source of truth. All models use get_feature_columns().
+REDUCED_FEATURES = [
+    "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
+    "PM2.5 (µg/m³)_roll7", "PM2.5 (µg/m³)_roll14", "PM10 (µg/m³)_roll7", "Index Value_roll7",
+    "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
+]
+
+
+def _all_feature_columns():
+    """Full set: base + lags + rolls + time + roll_std + trends + day_of_year."""
     base = [c for c in FEATURE_COLS] + ["PM_ratio", "temp_range"]
     lags = [f"{c}_lag{lag}" for c in base for lag in (1, 3, 7, 14)]
     lags += [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
     rolls = [f"{r}_roll{w}" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (3, 7, 14)]
     time_ = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
-    out = base + lags + rolls + time_
-    if USE_EXTRA_FEATURES:
-        rolls_std = [f"{r}_roll{w}_std" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (7, 14)]
-        trends = [f"{r}_trend7" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value")]
-        out = out + rolls_std + trends + ["day_of_year_sin", "day_of_year_cos"]
-    return out
+    rolls_std = [f"{r}_roll{w}_std" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value") for w in (7, 14)]
+    trends = [f"{r}_trend7" for r in ("PM2.5 (µg/m³)", "PM10 (µg/m³)", "Index Value")]
+    return base + lags + rolls + time_ + rolls_std + trends + ["day_of_year_sin", "day_of_year_cos"]
 
 
-def get_reduced_feature_columns():
-    """Reduced set: admission lags + key rolling + time."""
-    return [
-        "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
-        "PM2.5 (µg/m³)_roll7", "PM2.5 (µg/m³)_roll14", "PM10 (µg/m³)_roll7", "Index Value_roll7",
-        "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
-    ]
+def get_feature_columns():
+    """Columns used by all models; controlled by FEATURE_SET."""
+    return REDUCED_FEATURES if FEATURE_SET == "reduced" else _all_feature_columns()
 
 
-# ---------------------------------------------------------------------------
-# Split & scale
-# ---------------------------------------------------------------------------
+def _time_aware_split_indices(n, train_frac, val_frac, test_frac):
+    """Return (train_ix, val_ix, test_ix) as index arrays for chronological split."""
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    n_test = n - n_train - n_val
+    train_ix = np.arange(0, n_train)
+    val_ix = np.arange(n_train, n_train + n_val)
+    test_ix = np.arange(n_train + n_val, n)
+    return train_ix, val_ix, test_ix
 
-def training_data_split(df, train_frac=None, val_frac=None, test_frac=None):
-    """Time-ordered split. Scale features with scaler fitted on train only."""
+
+def _random_split_indices(n, train_frac, val_frac, test_frac, random_state=None):
+    """Return (train_ix, val_ix, test_ix) as index arrays for random split."""
+    rng = np.random.default_rng(random_state if random_state is not None else SPLIT_RANDOM_STATE)
+    perm = rng.permutation(n)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    n_test = n - n_train - n_val
+    train_ix = perm[:n_train]
+    val_ix = perm[n_train : n_train + n_val]
+    test_ix = perm[n_train + n_val :]
+    return train_ix, val_ix, test_ix
+
+
+def training_data_split(df, train_frac=None, val_frac=None, test_frac=None, use_random_split=None):
     train_frac = train_frac if train_frac is not None else TRAIN_FRAC
     val_frac = val_frac if val_frac is not None else VAL_FRAC
     test_frac = test_frac if test_frac is not None else TEST_FRAC
+    use_random = use_random_split if use_random_split is not None else USE_RANDOM_SPLIT
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-9
     feat_cols = [c for c in get_feature_columns() if c in df.columns]
     if not feat_cols:
@@ -182,15 +164,16 @@ def training_data_split(df, train_frac=None, val_frac=None, test_frac=None):
     X = df[feat_cols].astype(float)
     y = df[TARGET_COL]
     n = len(df)
-    n_train = int(n * train_frac)
-    n_val = int(n * val_frac)
-    n_test = n - n_train - n_val
-    X_train = X.iloc[:n_train]
-    X_val = X.iloc[n_train : n_train + n_val]
-    X_test = X.iloc[n_train + n_val :]
-    y_train = y.iloc[:n_train]
-    y_val = y.iloc[n_train : n_train + n_val]
-    y_test = y.iloc[n_train + n_val :]
+    if use_random:
+        train_ix, val_ix, test_ix = _random_split_indices(n, train_frac, val_frac, test_frac)
+    else:
+        train_ix, val_ix, test_ix = _time_aware_split_indices(n, train_frac, val_frac, test_frac)
+    X_train = X.iloc[train_ix].copy()
+    X_val = X.iloc[val_ix].copy()
+    X_test = X.iloc[test_ix].copy()
+    y_train = y.iloc[train_ix]
+    y_val = y.iloc[val_ix]
+    y_test = y.iloc[test_ix]
     scaler = RobustScaler() if SCALER_TYPE == "robust" else StandardScaler()
     X_train = pd.DataFrame(scaler.fit_transform(X_train), columns=feat_cols, index=X_train.index)
     X_val = pd.DataFrame(scaler.transform(X_val), columns=feat_cols, index=X_val.index)
@@ -198,12 +181,7 @@ def training_data_split(df, train_frac=None, val_frac=None, test_frac=None):
     return X_train, X_val, X_test, y_train, y_val, y_test, scaler
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
 def evaluate_model(model, X, y):
-    """Return dict with MAE, RMSE, R²."""
     pred = model.predict(X)
     return {
         "mae": mean_absolute_error(y, pred),
@@ -211,10 +189,6 @@ def evaluate_model(model, X, y):
         "r2": r2_score(y, pred),
     }
 
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
 
 def dummy_regression_model():
     return DummyRegressor(strategy="mean")
@@ -225,8 +199,6 @@ def ridge_tuned_model(cv=5):
 
 
 class RidgeLogTarget:
-    """Ridge on log(1+y); predict with expm1 for original scale."""
-
     def __init__(self):
         self._model = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=5)
 
@@ -243,13 +215,13 @@ def elastic_net_cv_model(cv=5):
 
 
 class RidgeReduced:
-    """Ridge on reduced feature set (admission lags + key rolling + time)."""
-
+    """Ridge on the same feature set as all models (FEATURE_SET)."""
     def __init__(self):
         self._model = RidgeCV(alphas=np.logspace(-2, 2, 50), cv=5)
+        self._cols = None
 
     def fit(self, X, y):
-        self._cols = [c for c in get_reduced_feature_columns() if c in X.columns]
+        self._cols = [c for c in get_feature_columns() if c in X.columns]
         self._cols = self._cols or X.columns.tolist()[:10]
         self._model.fit(X[self._cols], y)
         return self
@@ -278,8 +250,6 @@ def svm_model():
 
 
 def xgboost_model(random_state=42):
-    if not HAS_XGB:
-        raise ImportError("xgboost not installed")
     return xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=random_state)
 
 
@@ -291,12 +261,7 @@ def extra_trees_model(random_state=42):
     return ExtraTreesRegressor(n_estimators=150, max_depth=12, min_samples_leaf=5, random_state=random_state)
 
 
-# ---------------------------------------------------------------------------
-# Keras NN (TensorFlow) and Hyperopt tuning
-# ---------------------------------------------------------------------------
-
 def _build_keras_model(n_features, params, seed=42):
-    """Build and compile a Keras regression MLP. params: units, n_layers, dropout, lr, l2."""
     keras.backend.clear_session()
     tf.random.set_seed(seed)
     model = keras.Sequential()
@@ -312,17 +277,11 @@ def _build_keras_model(n_features, params, seed=42):
         model.add(layers.Dropout(dropout))
     model.add(layers.Dense(1, kernel_regularizer=reg))
     lr = float(params.get("lr", 1e-3))
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss="mse",
-        metrics=["mae"],
-    )
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss="mse", metrics=["mae"])
     return model
 
 
 class KerasRegressorWrapper:
-    """Sklearn-style wrapper for Keras regression (fit/predict)."""
-
     def __init__(self, params=None, epochs=200, batch_size=32, patience=15, random_state=42):
         self.params = params or {"units": 64, "n_layers": 2, "dropout": 0.2, "lr": 1e-3}
         self.epochs = epochs
@@ -355,65 +314,8 @@ class KerasRegressorWrapper:
         return self.model_.predict(X, verbose=0).ravel()
 
 
-def run_keras_hyperopt(X_train, y_train, X_val, y_val, X_test, y_test, max_evals=40, random_state=42):
-    """Tune Keras NN with Hyperopt (TPE); return (wrapper, test_metrics)."""
-    X_tr = np.asarray(X_train, dtype=np.float32)
-    y_tr = np.asarray(y_train, dtype=np.float32).reshape(-1, 1)
-    X_va = np.asarray(X_val, dtype=np.float32)
-    y_va = np.asarray(y_val, dtype=np.float32).reshape(-1, 1)
-    n_features = X_tr.shape[1]
-    units_choices = [16, 32, 64, 128]
-    n_layers_choices = [1, 2, 3]
-    space = {
-        "units": hp.choice("units", units_choices),
-        "n_layers": hp.choice("n_layers", n_layers_choices),
-        "dropout": hp.uniform("dropout", 0.2, 0.5),
-        "lr": hp.loguniform("lr", np.log(3e-4), np.log(3e-3)),
-        "l2": hp.loguniform("l2", np.log(5e-5), np.log(5e-3)),
-    }
-
-    def _get_choice(choices, idx):
-        if idx in choices:
-            return idx
-        i = int(idx) if isinstance(idx, (int, np.integer)) else 0
-        i = min(max(0, i), len(choices) - 1)
-        return choices[i]
-
-    def objective(pp):
-        params = {
-            "units": _get_choice(units_choices, pp["units"]),
-            "n_layers": _get_choice(n_layers_choices, pp["n_layers"]),
-            "dropout": float(pp["dropout"]),
-            "lr": float(pp["lr"]),
-            "l2": float(pp["l2"]),
-        }
-        model = _build_keras_model(n_features, params, random_state)
-        early = keras.callbacks.EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True)
-        model.fit(X_tr, y_tr, validation_data=(X_va, y_va), epochs=250, batch_size=32, callbacks=[early], verbose=0)
-        pred = model.predict(X_va, verbose=0).ravel()
-        return {"loss": -r2_score(y_val, pred), "status": STATUS_OK}
-
-    trials = Trials()
-    best = fmin(objective, space, algo=tpe.suggest, max_evals=max_evals, rstate=np.random.default_rng(random_state), verbose=0)
-    best_params = {
-        "units": _get_choice(units_choices, best["units"]),
-        "n_layers": _get_choice(n_layers_choices, best["n_layers"]),
-        "dropout": best["dropout"],
-        "lr": best["lr"],
-        "l2": best["l2"],
-    }
-    wrapper = KerasRegressorWrapper(params=best_params, epochs=250, batch_size=32, patience=20, random_state=random_state)
-    wrapper.fit(X_train, y_train, X_val=X_val, y_val=y_val)
-    test_metrics = evaluate_model(wrapper, X_test, y_test)
-    return wrapper, test_metrics
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
-    """Train each model; return list of (name, val_metrics, test_metrics)."""
+    """Train each model; return results list."""
     models = [
         ("Dummy (mean)", dummy_regression_model()),
         ("Ridge (CV)", ridge_tuned_model()),
@@ -426,13 +328,12 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
         ("Extra Trees", extra_trees_model()),
         ("FNN (MLP)", fnn_model()),
         ("SVR", svm_model()),
+        ("XGBoost", xgboost_model()),
+        ("Keras", KerasRegressorWrapper(epochs=200, patience=15)),
     ]
-    if HAS_XGB:
-        models.append(("XGBoost", xgboost_model()))
-    models.append(("Keras (default)", KerasRegressorWrapper(epochs=200, patience=15)))
     results = []
     for name, model in models:
-        if "Keras" in name and "tuned" not in name:
+        if "Keras" in name:
             model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
         else:
             model.fit(X_train, y_train)
@@ -451,118 +352,11 @@ def main():
 
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
+    print(f"  Features: {FEATURE_SET} ({X_train.shape[1]} cols)")
+    print(f"  Split: {'random' if USE_RANDOM_SPLIT else 'time-aware (chronological)'}")
     print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
 
     results = run_all_models(X_train, X_val, X_test, y_train, y_val, y_test)
-
-    reduced_cols = [c for c in get_reduced_feature_columns() if c in X_train.columns]
-    KERAS_USE_REDUCED = True  # Set False to tune Keras on full features
-    if reduced_cols and KERAS_USE_REDUCED:
-        X_train_r, X_val_r, X_test_r = X_train[reduced_cols], X_val[reduced_cols], X_test[reduced_cols]
-        print(f"Keras (Hyperopt tuning on reduced features, {KERAS_TRIALS} trials)...")
-        keras_wrapper, keras_tuned_test = run_keras_hyperopt(
-            X_train_r, y_train, X_val_r, y_val, X_test_r, y_test, max_evals=KERAS_TRIALS
-        )
-        keras_val = evaluate_model(keras_wrapper, X_val_r, y_val)
-    else:
-        print(f"Keras (Hyperopt tuning full features, {KERAS_TRIALS} trials)...")
-        keras_wrapper, keras_tuned_test = run_keras_hyperopt(
-            X_train, y_train, X_val, y_val, X_test, y_test, max_evals=KERAS_TRIALS
-        )
-        keras_val = evaluate_model(keras_wrapper, X_val, y_val)
-        reduced_cols = list(X_train.columns)  # Keras sees all features
-    results.append(("Keras (tuned)", keras_val, keras_tuned_test))
-
-    ridge_r = RidgeReduced()
-    ridge_r.fit(X_train, y_train)
-    enet = elastic_net_cv_model()
-    enet.fit(X_train, y_train)
-    gb = gradient_boosting_model()
-    gb.fit(X_train, y_train)
-    hist_gb = hist_gradient_boosting_model()
-    hist_gb.fit(X_train, y_train)
-    extra_trees = extra_trees_model()
-    extra_trees.fit(X_train, y_train)
-    xgb_m = None
-    if HAS_XGB:
-        xgb_m = xgboost_model()
-        xgb_m.fit(X_train, y_train)
-    ridge_log = RidgeLogTarget()
-    ridge_log.fit(X_train, y_train)
-
-    X_val_k = X_val[reduced_cols] if reduced_cols else X_val
-    p_val_r = ridge_r.predict(X_val).reshape(-1, 1)
-    p_val_e = enet.predict(X_val).reshape(-1, 1)
-    p_val_g = gb.predict(X_val).reshape(-1, 1)
-    p_val_h = hist_gb.predict(X_val).reshape(-1, 1)
-    p_val_et = extra_trees.predict(X_val).reshape(-1, 1)
-    p_val_k = keras_wrapper.predict(X_val_k).reshape(-1, 1)
-    p_val_x = xgb_m.predict(X_val).reshape(-1, 1) if HAS_XGB else None
-    p_val_log = ridge_log.predict(X_val).reshape(-1, 1)
-    P_val_3 = np.hstack([p_val_r, p_val_e, p_val_k])
-    meta_3 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_3, y_val)
-    r2_best = r2_score(y_val, meta_3.predict(P_val_3))
-    meta = meta_3
-    use_gb, use_xgb, use_log, use_hist_gb, use_et = False, False, False, False, False
-    P_val_4 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k])
-    meta_4 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_4, y_val)
-    if r2_score(y_val, meta_4.predict(P_val_4)) > r2_best:
-        r2_best, meta, use_gb, use_hist_gb, use_et = r2_score(y_val, meta_4.predict(P_val_4)), meta_4, True, False, False
-    if HAS_XGB:
-        P_val_5 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k, p_val_x])
-        meta_5 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_5, y_val)
-        if r2_score(y_val, meta_5.predict(P_val_5)) > r2_best:
-            meta, use_gb, use_xgb, use_hist_gb, use_et = meta_5, True, True, False, False
-        P_val_x3 = np.hstack([p_val_r, p_val_e, p_val_k, p_val_x])
-        meta_x3 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_x3, y_val)
-        if r2_score(y_val, meta_x3.predict(P_val_x3)) > r2_best:
-            meta, use_gb, use_xgb, use_hist_gb, use_et = meta_x3, False, True, False, False
-    P_val_6 = np.hstack([p_val_r, p_val_e, p_val_g, p_val_k, p_val_x, p_val_log]) if HAS_XGB else np.hstack([p_val_r, p_val_e, p_val_g, p_val_k, p_val_log])
-    meta_6 = RidgeCV(alphas=np.logspace(-3, 2, 30), cv=5).fit(P_val_6, y_val)
-    if r2_score(y_val, meta_6.predict(P_val_6)) > r2_best:
-        meta, use_gb, use_xgb, use_log, use_hist_gb, use_et = meta_6, True, HAS_XGB, True, False, False
-
-    class StackingPredictor:
-        def __init__(self, ridge, enet, gb, hist_gb, et, keras_w, xgb_m, ridge_log, meta, use_reduced, use_gb, use_xgb, use_log, use_hist_gb, use_et):
-            self.ridge, self.enet, self.gb = ridge, enet, gb
-            self.hist_gb, self.et = hist_gb, et
-            self.keras_w, self.xgb_m, self.ridge_log = keras_w, xgb_m, ridge_log
-            self.meta = meta
-            self.use_reduced = use_reduced
-            self.use_gb, self.use_xgb, self.use_log = use_gb, use_xgb, use_log
-            self.use_hist_gb, self.use_et = use_hist_gb, use_et
-        def predict(self, X):
-            X_k = X[reduced_cols] if self.use_reduced and reduced_cols else X
-            pr = self.ridge.predict(X).reshape(-1, 1)
-            pe = self.enet.predict(X).reshape(-1, 1)
-            pk = self.keras_w.predict(X_k).reshape(-1, 1)
-            parts = [pr, pe, pk]
-            if self.use_gb:
-                parts.insert(2, self.gb.predict(X).reshape(-1, 1))
-            elif self.use_hist_gb:
-                parts.insert(2, self.hist_gb.predict(X).reshape(-1, 1))
-            elif self.use_et:
-                parts.insert(2, self.et.predict(X).reshape(-1, 1))
-            if self.use_xgb and HAS_XGB:
-                parts.append(self.xgb_m.predict(X).reshape(-1, 1))
-            if self.use_log:
-                parts.append(self.ridge_log.predict(X).reshape(-1, 1))
-            return self.meta.predict(np.hstack(parts))
-    ens = StackingPredictor(ridge_r, enet, gb, hist_gb, extra_trees, keras_wrapper, xgb_m if HAS_XGB else None, ridge_log, meta, bool(reduced_cols), use_gb, use_xgb, use_log, use_hist_gb, use_et)
-    ens_val_metrics = evaluate_model(ens, X_val, y_val)
-    ens_test_metrics = evaluate_model(ens, X_test, y_test)
-    stack_name = "Stacking (Ridge+EN+Keras)"
-    if use_gb:
-        stack_name = stack_name.replace("+Keras)", "+GB+Keras)")
-    if use_hist_gb:
-        stack_name = stack_name.replace("+Keras)", "+HistGB+Keras)")
-    if use_et:
-        stack_name = stack_name.replace("+Keras)", "+ET+Keras)")
-    if use_xgb and HAS_XGB:
-        stack_name = stack_name.replace(")", "+XGB)")
-    if use_log:
-        stack_name = stack_name.replace(")", "+RidgeLog)")
-    results.append((stack_name, ens_val_metrics, ens_test_metrics))
 
     print("Model comparison (Validation | Test)")
     print("-" * 72)
@@ -574,8 +368,6 @@ def main():
 
     best_name, _, best_test = max(results, key=lambda r: r[2]["r2"])
     print(f"\nBest by Test R²: {best_name}  (R² = {best_test['r2']:.4f})")
-    if best_test["r2"] >= 0.5:
-        print("Target R² ≥ 0.5 reached.")
 
 
 if __name__ == "__main__":
