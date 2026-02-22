@@ -22,7 +22,7 @@ from keras import layers
 USE_IMPUTATION = True
 WINSORIZE_QUANTILE = 0.99
 TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10
-USE_RANDOM_SPLIT = True  # True: random split; False: time-aware (chronological) split
+USE_RANDOM_SPLIT = False  # True: random split; False: time-aware (chronological) split
 SPLIT_RANDOM_STATE = 42   # used when USE_RANDOM_SPLIT is True
 SCALER_TYPE = "standard"
 
