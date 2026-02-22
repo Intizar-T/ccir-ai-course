@@ -1,7 +1,9 @@
 """
-Predict Number of Admissions from air quality and weather (merged_data.csv).
-Pipeline: load → preprocess → feature engineering → train/val/test split (time-aware or random, see USE_RANDOM_SPLIT)
-→ train models → report comparison and best by Test R².
+Predict Number of Admissions from past air quality and weather (all_features_data.csv).
+
+Uses 1-, 3-, 7-day lags and 3- and 7-day rolling means for all air/weather features (no same-day),
+plus time features and admission_lag7 (same weekday last week). Pipeline: load → preprocess
+→ feature engineering → time-aware split → train models → report comparison and best by Test R².
 """
 
 import os
@@ -22,34 +24,47 @@ from keras import layers
 USE_IMPUTATION = True
 WINSORIZE_QUANTILE = 0.99
 TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10
-USE_RANDOM_SPLIT = False  # True: random split; False: time-aware (chronological) split
-SPLIT_RANDOM_STATE = 42   # used when USE_RANDOM_SPLIT is True
+USE_RANDOM_SPLIT = False
+SPLIT_RANDOM_STATE = 42
 SCALER_TYPE = "standard"
+
+LAG_DAYS = [1, 3, 7]
+ROLL_WINDOWS = [3, 7]
+ADMISSION_LAG_7 = "admission_lag7"
 
 TIMESTAMP_COL = "Timestamp"
 DATE_COL = "Date"
 TARGET_COL = "Number of Admissions"
-# Engineered features added in feature_engineering() (on top of dataset features).
-ADMISSION_LAGS_AND_TIME = [
-    "admissions_lag1", "admissions_lag3", "admissions_lag7", "admissions_lag14",
-    "dow_sin", "dow_cos", "month_sin", "month_cos", "weekend",
-]
+
+TIME_FEATURES = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
+
+
+def get_raw_feature_columns(df):
+    """Numeric air/weather columns only (exclude date, target, and outcome-like columns)."""
+    exclude = {DATE_COL, TARGET_COL}
+    outcome_like = ["brought_dead", "admission"]
+    return [
+        c for c in df.columns
+        if c not in exclude
+        and pd.api.types.is_numeric_dtype(df[c])
+        and not any(kw in c.lower() for kw in outcome_like)
+    ]
 
 
 def get_feature_columns(df):
-    """All numeric dataset columns (except timestamp/date and target) + ADMISSION_LAGS_AND_TIME."""
-    exclude = (TARGET_COL, DATE_COL)
-    dataset_features = [
+    """Model input: time features + _lag1/_lag3/_lag7, _roll3/_roll7, and admission_lag7 (no same-day raw)."""
+    time_cols = [c for c in TIME_FEATURES if c in df.columns]
+    lag_roll = [
         c for c in df.columns
-        if c not in exclude and c not in ADMISSION_LAGS_AND_TIME and pd.api.types.is_numeric_dtype(df[c])
+        if any(c.endswith(f"_lag{k}") for k in LAG_DAYS) or any(c.endswith(f"_roll{k}") for k in ROLL_WINDOWS)
     ]
-    engineered = [c for c in ADMISSION_LAGS_AND_TIME if c in df.columns]
-    return dataset_features + engineered
+    admission_cols = [ADMISSION_LAG_7] if ADMISSION_LAG_7 in df.columns else []
+    return time_cols + lag_roll + admission_cols
 
 
 def load_data():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(script_dir, "data", "merged_data.csv")
+    path = os.path.join(script_dir, "data", "all_features_data.csv")
     df = pd.read_csv(path)
     if TIMESTAMP_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
@@ -60,21 +75,19 @@ def load_data():
 def preprocess_data(df, impute_features=False):
     df = df.sort_values(DATE_COL).copy()
     df = df.dropna(subset=[TARGET_COL])
-    feature_cols = get_feature_columns(df)
+    raw_cols = get_raw_feature_columns(df)
     if impute_features:
-        for col in feature_cols:
+        for col in raw_cols:
             if col in df.columns and df[col].isna().any():
                 df[col] = df[col].ffill().bfill()
-        df = df.dropna(subset=[c for c in feature_cols if c in df.columns])
-    else:
-        df = df.dropna(subset=[c for c in feature_cols if c in df.columns])
+    df = df.dropna(subset=raw_cols)
     q = df[TARGET_COL].quantile(WINSORIZE_QUANTILE)
     df.loc[df[TARGET_COL] > q, TARGET_COL] = q
     return df.reset_index(drop=True)
 
 
 def feature_engineering(df):
-    """Add admission lags and time features only (no rolling means)."""
+    """Add time features, 1/3/7-day lags and 3/7-day rolling means for air/weather, plus admission_lag7."""
     df = df.sort_values(DATE_COL).reset_index(drop=True)
     dt = pd.to_datetime(df[DATE_COL])
     df["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
@@ -82,10 +95,23 @@ def feature_engineering(df):
     df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
     df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
     df["weekend"] = (dt.dt.dayofweek >= 5).astype(np.float64)
-    for lag in (1, 3, 7, 14):
-        df[f"admissions_lag{lag}"] = df[TARGET_COL].shift(lag)
-    adm_cols = [f"admissions_lag{lag}" for lag in (1, 3, 7, 14)]
-    df = df.dropna(how="any", subset=adm_cols)
+
+    raw_cols = get_raw_feature_columns(df)
+    new_cols = {}
+    lag_roll_cols = []
+    for col in raw_cols:
+        for k in LAG_DAYS:
+            name = f"{col}_lag{k}"
+            new_cols[name] = df[col].shift(k)
+            lag_roll_cols.append(name)
+        for w in ROLL_WINDOWS:
+            name = f"{col}_roll{w}"
+            new_cols[name] = df[col].rolling(w, min_periods=1).mean().shift(1)
+            lag_roll_cols.append(name)
+    new_cols[ADMISSION_LAG_7] = df[TARGET_COL].shift(7)
+    lag_roll_cols.append(ADMISSION_LAG_7)
+    df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    df = df.dropna(how="any", subset=lag_roll_cols)
     return df.reset_index(drop=True)
 
 
@@ -93,7 +119,6 @@ def _time_aware_split_indices(n, train_frac, val_frac, test_frac):
     """Return (train_ix, val_ix, test_ix) as index arrays for chronological split."""
     n_train = int(n * train_frac)
     n_val = int(n * val_frac)
-    n_test = n - n_train - n_val
     train_ix = np.arange(0, n_train)
     val_ix = np.arange(n_train, n_train + n_val)
     test_ix = np.arange(n_train + n_val, n)
@@ -106,7 +131,6 @@ def _random_split_indices(n, train_frac, val_frac, test_frac, random_state=None)
     perm = rng.permutation(n)
     n_train = int(n * train_frac)
     n_val = int(n * val_frac)
-    n_test = n - n_train - n_val
     train_ix = perm[:n_train]
     val_ix = perm[n_train : n_train + n_val]
     test_ix = perm[n_train + n_val :]
@@ -173,21 +197,6 @@ class RidgeLogTarget:
 
 def elastic_net_cv_model(cv=5):
     return ElasticNetCV(cv=cv, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=np.logspace(-3, 1, 50), max_iter=5000)
-
-
-class RidgeReduced:
-    """Ridge on the same feature set as all models."""
-    def __init__(self):
-        self._model = RidgeCV(alphas=np.logspace(-2, 2, 50), cv=5)
-        self._cols = None
-
-    def fit(self, X, y):
-        self._cols = X.columns.tolist()
-        self._model.fit(X[self._cols], y)
-        return self
-
-    def predict(self, X):
-        return self._model.predict(X[self._cols])
 
 
 def random_forest_regression_model(random_state=42):
@@ -281,7 +290,6 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
         ("Ridge (CV)", ridge_tuned_model()),
         ("Ridge (log y)", RidgeLogTarget()),
         ("ElasticNet (CV)", elastic_net_cv_model()),
-        ("Ridge (reduced)", RidgeReduced()),
         ("Random Forest", random_forest_regression_model()),
         ("Gradient Boosting", gradient_boosting_model()),
         ("Hist Gradient Boosting", hist_gradient_boosting_model()),

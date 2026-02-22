@@ -1,6 +1,6 @@
 """
-Optimized training: each model tuned with the most suitable optimizer.
-- Ridge/ElasticNet/RidgeReduced/RidgeLog: built-in CV (RidgeCV/ElasticNetCV).
+Optimized training: uses train.py pipeline (all_features_data, lags 1/3/7, roll 3/7, admission_lag7).
+- Ridge/ElasticNet/RidgeLog: built-in CV (RidgeCV/ElasticNetCV).
 - Tree/ensemble (RF, GBM, HistGB, ExtraTrees, XGBoost), SVR, MLP, Keras: Optuna.
 """
 
@@ -267,9 +267,6 @@ def main():
 
     enet = ElasticNetCV(cv=5, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=np.logspace(-3, 1, 50), max_iter=5000).fit(X_train, y_train)
     results.append(("ElasticNet (CV)", evaluate_model(enet, X_val, y_val), evaluate_model(enet, X_test, y_test)))
-
-    ridge_red = RidgeCV(alphas=np.logspace(-2, 2, 50), cv=5).fit(X_train, y_train)
-    results.append(("Ridge (reduced)", evaluate_model(ridge_red, X_val, y_val), evaluate_model(ridge_red, X_test, y_test)))
 
     # Optuna-tuned models
     print("Tuning Random Forest...")
