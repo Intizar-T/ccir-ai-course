@@ -83,9 +83,41 @@ def add_regime_kmeans(df, n_clusters=3, train_frac=TRAIN_FRAC, random_state=SEED
     return df
 
 
+from sklearn.mixture import GaussianMixture
+
 def add_regime_gmm(df, n_components=3, train_frac=TRAIN_FRAC, random_state=SEED):
-    """Stub for GMM regime detection. To be implemented."""
-    raise NotImplementedError("GMM regime not implemented yet; use regime_detector='kmeans'.")
+    """
+    Fit GMM on the training portion and assign regime labels to the whole dataset.
+    """
+    set_seed(random_state)
+    cols = [c for c in REGIME_FEATURE_COLS if c in df.columns]
+    
+    train_end = int(len(df) * train_frac)
+    X = df[cols].values
+    
+    # Scale based ONLY on training data to prevent leakage
+    scaler = StandardScaler()
+    scaler.fit(X[:train_end])
+    X_scaled = scaler.transform(X)
+    
+    # Initialize and Fit GMM
+    gmm = GaussianMixture(
+        n_components=n_components, 
+        covariance_type='full', 
+        random_state=random_state, 
+        n_init=10
+    )
+    gmm.fit(X_scaled[:train_end])
+    
+    df = df.copy()
+    # Assign the most likely regime label (hard clustering)
+    df['regime'] = gmm.predict(X_scaled)
+    
+    # OPTIONAL ADVANCED STEP: 
+    # You could also add the 'probabilities' of each regime as features,
+    # but for now, we will use the labels to keep it comparable to K-Means.
+    
+    return df
 
 
 def add_regime_hmm(df, n_components=3, train_frac=TRAIN_FRAC, random_state=SEED):
@@ -113,14 +145,30 @@ def add_regime_and_save(df, regime_detector='kmeans', output_path=None, **kwargs
     return df
 
 
+def encode_scalar_regime_to_onehot(df):
+    """
+    Replace integer column 'regime' (0..K-1) with one-hot columns regime_0..regime_{K-1}.
+    Only for scalar regime (e.g. KMeans/GMM/HMM hard labels). No scaling applied to these.
+    If 'regime' not in df, returns df unchanged.
+    """
+    if 'regime' not in df.columns:
+        return df
+    df = df.copy()
+    K = int(df['regime'].max()) + 1
+    for i in range(K):
+        df[f'regime_{i}'] = (df['regime'] == i).astype(np.int32)
+    df = df.drop(columns=['regime'])
+    return df
+
+
 def feature_engineering(df):
-    """Creates the 21-day forward target (no scaling). feature_cols include 'regime' if present."""
+    """Creates the 21-day forward target (no scaling). feature_cols = base + any regime_* columns (generic)."""
     indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=FORECAST_HORIZON)
     df['Target_21d'] = df['SPY_Returns'].rolling(window=indexer).sum().shift(-1)
     df.dropna(inplace=True)
     feature_cols = list(BASE_FEATURE_COLS)
-    if 'regime' in df.columns:
-        feature_cols = feature_cols + ['regime']
+    regime_cols = sorted([c for c in df.columns if c.startswith('regime_')])
+    feature_cols = feature_cols + regime_cols
     return df, feature_cols
 
 
@@ -135,17 +183,21 @@ def create_sequences(X, y, window_size):
 
 def scale_and_split(df, feature_cols, input_window, scaler_class):
     """
-    Scale only X (fit on train). y stays raw. No target scaling.
-    scaler_class: StandardScaler or RobustScaler.
+    Scale only base feature columns (fit on train). Regime columns (regime_*) are not scaled.
+    y stays raw. scaler_class: StandardScaler or RobustScaler.
     """
     N = len(df)
     train_end = int(N * TRAIN_FRAC)
     val_end = int(N * (TRAIN_FRAC + VAL_FRAC))
+    feature_cols_scale = [c for c in feature_cols if c in BASE_FEATURE_COLS]
+    feature_cols_no_scale = [c for c in feature_cols if c not in BASE_FEATURE_COLS]
     scaler_X = scaler_class()
-    scaler_X.fit(df[feature_cols].iloc[:train_end])
-    X_scaled = scaler_X.transform(df[feature_cols])
+    scaler_X.fit(df[feature_cols_scale].iloc[:train_end])
+    X_scale = scaler_X.transform(df[feature_cols_scale])
+    X_no_scale = df[feature_cols_no_scale].values if feature_cols_no_scale else np.empty((len(df), 0))
+    X = np.hstack([X_scale, X_no_scale])
     y_raw = df['Target_21d'].values.reshape(-1, 1)
-    X_seq, y_seq = create_sequences(X_scaled, y_raw, input_window)
+    X_seq, y_seq = create_sequences(X, y_raw, input_window)
     train_seq_end = train_end - input_window
     val_seq_end = val_end - input_window
     X_train = X_seq[:train_seq_end]
@@ -228,6 +280,7 @@ def objective(params):
     df = pd.read_csv(file_path)
     df['Date'] = pd.to_datetime(df['Date'])
     df.set_index('Date', inplace=True)
+    df = encode_scalar_regime_to_onehot(df)
     df, feature_cols = feature_engineering(df)
     scaler_class = RobustScaler if params['scaler'] == 'robust' else StandardScaler
     try:
@@ -371,6 +424,7 @@ def run_pipeline_with_regime(
     else:
         raise ValueError(f"regime_detector must be 'kmeans', 'gmm', or 'hmm'; got {regime_detector}")
 
+    df = encode_scalar_regime_to_onehot(df)
     _CURRENT_DATA_PATH = output_path
     df, feature_cols = feature_engineering(df)
     print(f"Features (with regime): {feature_cols}")
@@ -441,6 +495,6 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--regime':
         detector = sys.argv[2] if len(sys.argv) > 2 else 'kmeans'
         n_clusters = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-        run_pipeline_with_regime(regime_detector=detector, n_clusters=n_clusters, do_hyperopt=False)
+        run_pipeline_with_regime(regime_detector=detector, n_clusters=n_clusters, do_hyperopt=True)
     else:
         main()

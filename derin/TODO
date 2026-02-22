@@ -1,0 +1,3 @@
+- encode KMeans regime values in the dataset (before feeding to LSTM). Don't apply a scaler on the encoded column
+- implement HMM
+- use BIC to optimize regime count across kmeans, gmm, hmm
