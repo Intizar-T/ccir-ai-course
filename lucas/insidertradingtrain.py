@@ -36,12 +36,21 @@ N_OPTUNA_TRIALS = 150
 
 def process_data():
     """
-    Loads the insider-trading features dataset from CSV, converts date columns,
-    handles missing values, and drops rows without a valid target.
+    Loads the insider-trading features dataset from CSV (output of create_dataset.py),
+    converts date columns, handles missing values, and drops rows without a valid target.
     Returns a cleaned pandas DataFrame.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(script_dir, 'features_with_labels.csv')
+
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(
+            f"Dataset not found: {file_path}\n"
+            "Run create_dataset.py first to generate features_with_labels.csv"
+        )
+    mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+    print(f"Loading dataset: {file_path}")
+    print(f"  (last modified: {mtime.strftime('%Y-%m-%d %H:%M')})")
 
     df = pd.read_csv(file_path)
     df['transaction_date'] = pd.to_datetime(df['transaction_date'])
