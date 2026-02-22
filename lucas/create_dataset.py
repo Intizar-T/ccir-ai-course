@@ -250,7 +250,14 @@ for i in range(0, len(unique_tickers), batch_size):
             if not ticker_data.empty:
                 ticker_data = ticker_data.reset_index()
                 if isinstance(ticker_data.columns, pd.MultiIndex):
-                    ticker_data.columns = ticker_data.columns.get_level_values(0)
+                    ticker_data.columns = [
+                        c[0] if isinstance(c, tuple) else c
+                        for c in ticker_data.columns
+                    ]
+                # Drop duplicate columns (yfinance quirk with some tickers)
+                ticker_data = ticker_data.loc[
+                    :, ~ticker_data.columns.duplicated()
+                ]
                 rename_map = {
                     'Date': 'date', 'Datetime': 'date',
                     'Open': 'open', 'High': 'high', 'Low': 'low',
@@ -263,9 +270,13 @@ for i in range(0, len(unique_tickers), batch_size):
                     ticker_data['close'] = ticker_data['close_adj']
                     ticker_data = ticker_data.drop(columns=['close_adj'], errors='ignore')
                 ticker_data['ticker'] = ticker
-                prices_list.append(
-                    ticker_data[['ticker', 'date', 'open', 'high', 'low',
-                                 'close', 'volume']])
+                needed = ['ticker', 'date', 'open', 'high', 'low',
+                          'close', 'volume']
+                missing = [c for c in needed if c not in ticker_data.columns]
+                if missing:
+                    failed_tickers.append(ticker)
+                    continue
+                prices_list.append(ticker_data[needed])
                 batch_success += 1
                 success_count += 1
             else:
@@ -311,7 +322,11 @@ sp500_data = yf.download('^GSPC', start=start_date, end=end_date,
 if not sp500_data.empty:
     sp500_data = sp500_data.reset_index()
     if isinstance(sp500_data.columns, pd.MultiIndex):
-        sp500_data.columns = sp500_data.columns.get_level_values(0)
+        sp500_data.columns = [
+            c[0] if isinstance(c, tuple) else c
+            for c in sp500_data.columns
+        ]
+    sp500_data = sp500_data.loc[:, ~sp500_data.columns.duplicated()]
     rename_map = {'Date': 'date', 'Datetime': 'date',
                   'Close': 'close', 'Adj Close': 'close_adj'}
     sp500_data = sp500_data.rename(
