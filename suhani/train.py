@@ -87,12 +87,48 @@ def get_feature_columns(df):
 
 
 def load_data():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(script_dir, "data", "all_features_data.csv")
+    """
+    Regression: use all_features_data_changed_2.csv and apply
+    the regression-specific drop list (no classification-only drops).
+    """
+    # Main path (same as Optuna regression script)
+    path = "/Users/suhaniagarwal/Downloads/all_features_data_changed_2.csv"
+    if not os.path.exists(path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, "all_features_data_changed_2.csv")
+
     df = pd.read_csv(path)
+
+    # Ensure Date exists (for your existing feature_engineering)
     if TIMESTAMP_COL in df.columns:
-        df[DATE_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
+        df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
+        df[DATE_COL] = df[TIMESTAMP_COL].dt.normalize()
+
+    # --- Regression drop list (exactly from Regression_optuna_all_features_changed2.py) ---
+    drop_exact = [
+        "wind_speed_10m_max (km/h)",
+        "temperature_2m_min (°C)",
+        "wind_gusts_10m_max (km/h)",
+        "NO2 (µg/m³)",
+        "Benzene (µg/m³)",
+        "PM10 (µg/m³)",
+        "NO (µg/m³)",
+        "relative_humidity_2m_min (%)",
+        "Toluene (µg/m³)",
+        "Ozone (µg/m³)",
+    ]
+    df = df.drop(columns=[c for c in drop_exact if c in df.columns])
+
+    # NOx / NH3 removals (as in Optuna script)
+    nh3_cols = [c for c in df.columns if "NH3" in c]
+    nox_cols = [c for c in df.columns if "NOx" in c]
+    if nh3_cols or nox_cols:
+        df = df.drop(columns=list(set(nh3_cols + nox_cols)))
+
+    # Keep behavior consistent with original regression (no Timestamp column afterwards)
+    if TIMESTAMP_COL in df.columns:
         df = df.drop(columns=[TIMESTAMP_COL])
+
     return df
 
 
@@ -516,6 +552,101 @@ def run_optuna_models(
     results.append(("Keras (tuned)", vm, tm))
 
     return results
+def run_regression_time_series_cv(df, n_splits=N_SPLITS):
+    """
+    5-fold time-series CV for regression, using the same feature set
+    and models as the single-split pipeline (including Optuna models).
+    """
+    feat_cols = [c for c in get_feature_columns(df) if c in df.columns]
+    if not feat_cols:
+        raise ValueError("No feature columns found in df for CV.")
+
+    X = df[feat_cols].astype(float)
+    y = df[TARGET_COL]
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    results_per_model = {}  # name -> {"val": [dict], "test": [dict]}
+
+    print(f"\nRegression: {n_splits}-fold time-series CV\n")
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X), start=1):
+        print(f"Fold {fold}/{n_splits}...")
+
+        X_train_full, X_test = X.iloc[train_idx].copy(), X.iloc[test_idx].copy()
+        y_train_full, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        # Time-aware split inside the training chunk: first 80% train, last 20% val
+        split = int(len(X_train_full) * 0.8)
+        X_train = X_train_full.iloc[:split].copy()
+        X_val = X_train_full.iloc[split:].copy()
+        y_train = y_train_full.iloc[:split]
+        y_val = y_train_full.iloc[split:]
+
+        scaler = RobustScaler() if SCALER_TYPE == "robust" else StandardScaler()
+        X_train_s = pd.DataFrame(
+            scaler.fit_transform(X_train), columns=feat_cols, index=X_train.index
+        )
+        X_val_s = pd.DataFrame(
+            scaler.transform(X_val), columns=feat_cols, index=X_val.index
+        )
+        X_test_s = pd.DataFrame(
+            scaler.transform(X_test), columns=feat_cols, index=X_test.index
+        )
+
+        # Base models (no Optuna) on this fold
+        fold_results = run_all_models(
+            X_train_s, X_val_s, X_test_s, y_train, y_val, y_test
+        )
+
+        # Optuna-tuned models on this fold
+        optuna_results = run_optuna_models(
+            X_train_s, X_val_s, X_test_s, y_train, y_val, y_test
+        )
+        fold_results.extend(optuna_results)
+
+        # Accumulate metrics
+        for name, vm, tm in fold_results:
+            if name not in results_per_model:
+                results_per_model[name] = {"val": [], "test": []}
+            results_per_model[name]["val"].append(vm)
+            results_per_model[name]["test"].append(tm)
+
+    # Average metrics across folds
+    avg_results = []
+    for name, metrics_lists in results_per_model.items():
+        val_ms = metrics_lists["val"]
+        test_ms = metrics_lists["test"]
+
+        val_avg = {
+            "mae": np.mean([m["mae"] for m in val_ms]),
+            "rmse": np.mean([m["rmse"] for m in val_ms]),
+            "r2": np.mean([m["r2"] for m in val_ms]),
+        }
+        test_avg = {
+            "mae": np.mean([m["mae"] for m in test_ms]),
+            "rmse": np.mean([m["rmse"] for m in test_ms]),
+            "r2": np.mean([m["r2"] for m in test_ms]),
+        }
+        avg_results.append((name, val_avg, test_avg))
+
+    # Print summary table
+    print("\nRegression model comparison (5-fold CV: Validation | Test)")
+    print("-" * 72)
+    print(
+        f"{'Model':<28} {'Val MAE':>8} {'Val RMSE':>8} {'Val R²':>8}  |  "
+        f"{'Test MAE':>8} {'Test RMSE':>8} {'Test R²':>8}"
+    )
+    print("-" * 72)
+    for name, vm, tm in avg_results:
+        print(
+            f"{name:<28} "
+            f"{vm['mae']:>8.4f} {vm['rmse']:>8.4f} {vm['r2']:>8.4f}  |  "
+            f"{tm['mae']:>8.4f} {tm['rmse']:>8.4f} {tm['r2']:>8.4f}"
+        )
+    print("-" * 72)
+
+    best_name, _, best_test = max(avg_results, key=lambda r: r[2]["r2"])
+    print(f"\nBest by CV Test R²: {best_name}  (R² = {best_test['r2']:.4f})")
 
 def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
     """Train each model; return results list."""
@@ -783,35 +914,28 @@ def run_classification_pipeline():
     plt.show()
 
 def main():
+    # Load + preprocess + feature engineering once
     df = load_data()
     n_load = len(df)
     df = preprocess_data(df, impute_features=USE_IMPUTATION)
     n_pre = len(df)
     df = feature_engineering(df)
     n_fe = len(df)
-    X_train, X_val, X_test, y_train, y_val, y_test, _ = training_data_split(df)
 
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
-    print(f"  Features: {X_train.shape[1]} cols")
-    print(f"  Split: {'random' if USE_RANDOM_SPLIT else 'time-aware (chronological)'}")
-    print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
+    print(f"  Features after FE: {len(get_feature_columns(df))} cols")
+    print(f"  Time-series CV folds: {N_SPLITS}\n")
 
-    results = run_all_models(X_train, X_val, X_test, y_train, y_val, y_test)
-    # Run Optuna-tuned models and append them to the comparison table
-    optuna_results = run_optuna_models(X_train, X_val, X_test, y_train, y_val, y_test)
-    results.extend(optuna_results)
-    print("Model comparison (Validation | Test)")
-    print("-" * 72)
-    print(f"{'Model':<18} {'Val MAE':>8} {'Val RMSE':>8} {'Val R²':>8}  |  {'Test MAE':>8} {'Test RMSE':>8} {'Test R²':>8}")
-    print("-" * 72)
-    for name, vm, tm in results:
-        print(f"{name:<18} {vm['mae']:>8.4f} {vm['rmse']:>8.4f} {vm['r2']:>8.4f}  |  {tm['mae']:>8.4f} {tm['rmse']:>8.4f} {tm['r2']:>8.4f}")
-    print("-" * 72)
-
-    best_name, _, best_test = max(results, key=lambda r: r[2]["r2"])
-    print(f"\nBest by Test R²: {best_name}  (R² = {best_test['r2']:.4f})")
+    # 5-fold time-aware CV for regression (includes Optuna-tuned models)
+    run_regression_cv(df)
 
 
 if __name__ == "__main__":
+    # Regression (with Optuna-tuned models)
     main()
+
+    # Classification (binary, threshold = THRESHOLD)
+    # Uncomment this line when you also want to run the classification pipeline:
+
+    run_classification_pipeline()
