@@ -20,6 +20,24 @@ from sklearn.svm import SVR
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers
+import optuna
+import matplotlib.pyplot as plt
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
+from sklearn.svm import SVC
+from sklearn.model_selection import TimeSeriesSplit
+import warnings
+
+warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 USE_IMPUTATION = True
 WINSORIZE_QUANTILE = 0.99
@@ -37,6 +55,12 @@ DATE_COL = "Date"
 TARGET_COL = "Number of Admissions"
 
 TIME_FEATURES = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
+# Extra configuration for Optuna tuning and classification
+THRESHOLD = 20           # admissions threshold for binary classification
+N_SPLITS = 5             # time-series CV splits for classification
+N_TRIALS = 25            # Optuna trials per tunable model
+RANDOM_STATE = 42
+WIND_DIR_COL = "wind_direction_10m_dominant (°)"
 
 
 def get_raw_feature_columns(df):
@@ -282,6 +306,216 @@ class KerasRegressorWrapper:
         X = np.asarray(X, dtype=np.float32)
         return self.model_.predict(X, verbose=0).ravel()
 
+class XGBRegressorWrapper(xgb.XGBRegressor):
+    """
+    Thin wrapper around XGBRegressor to always work with NumPy arrays.
+    This avoids pandas/xgboost dtype quirks.
+    """
+
+    def fit(self, X, y, *args, **kwargs):
+        X_arr = np.asarray(X, dtype=np.float32)
+        y_arr = np.asarray(y, dtype=np.float32)
+        return super().fit(X_arr, y_arr, *args, **kwargs)
+
+    def predict(self, X, *args, **kwargs):
+        X_arr = np.asarray(X, dtype=np.float32)
+        return super().predict(X_arr, *args, **kwargs)
+
+
+class _PredictorWrapper:
+    """
+    Simple wrapper so we can reuse evaluate_model with objects that only
+    expose a predict(X) function.
+    """
+
+    def __init__(self, predict_fn):
+        self.predict = predict_fn
+
+
+def _build_keras_model_optuna(n_features, params, seed=RANDOM_STATE):
+    keras.backend.clear_session()
+    tf.random.set_seed(seed)
+    model = keras.Sequential()
+    model.add(keras.Input(shape=(n_features,)))
+    reg = keras.regularizers.L2(params["l2"]) if params["l2"] > 0 else None
+    for _ in range(params["n_layers"]):
+        model.add(
+            layers.Dense(
+                params["units"],
+                activation="relu",
+                kernel_initializer="he_normal",
+                kernel_regularizer=reg,
+            )
+        )
+        model.add(layers.BatchNormalization())
+        model.add(layers.Dropout(params["dropout"]))
+    model.add(layers.Dense(1, kernel_regularizer=reg))
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=params["lr"]),
+        loss="mse",
+        metrics=["mae"],
+    )
+    return model
+
+
+def tune_and_fit_keras_optuna(
+    X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS
+):
+    X_tr = np.asarray(X_train, dtype=np.float32)
+    y_tr = np.asarray(y_train, dtype=np.float32).reshape(-1, 1)
+    X_va = np.asarray(X_val, dtype=np.float32)
+    y_va = np.asarray(y_val, dtype=np.float32).reshape(-1, 1)
+    n_features = X_tr.shape[1]
+
+    def objective(trial):
+        params = {
+            "units": trial.suggest_categorical("units", [16, 32, 64, 128]),
+            "n_layers": trial.suggest_int("n_layers", 1, 3),
+            "dropout": trial.suggest_float("dropout", 0.2, 0.5),
+            "lr": trial.suggest_float("lr", 3e-4, 3e-3, log=True),
+            "l2": trial.suggest_float("l2", 5e-5, 5e-3, log=True),
+        }
+        model = _build_keras_model_optuna(n_features, params, RANDOM_STATE)
+        early = keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=15,
+            restore_best_weights=True,
+        )
+        model.fit(
+            X_tr,
+            y_tr,
+            validation_data=(X_va, y_va),
+            epochs=250,
+            batch_size=32,
+            callbacks=[early],
+            verbose=0,
+        )
+        pred = model.predict(X_va, verbose=0).ravel()
+        return r2_score(y_val, pred)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best = study.best_params
+    best["units"] = int(best["units"])
+    best["n_layers"] = int(best["n_layers"])
+
+    final = _build_keras_model_optuna(n_features, best, RANDOM_STATE)
+    early = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=20,
+        restore_best_weights=True,
+    )
+    final.fit(
+        X_tr,
+        y_tr,
+        validation_data=(X_va, y_va),
+        epochs=250,
+        batch_size=32,
+        callbacks=[early],
+        verbose=0,
+    )
+
+    wrap = _PredictorWrapper(
+        lambda X: final.predict(np.asarray(X, dtype=np.float32), verbose=0).ravel()
+    )
+    return final, evaluate_model(wrap, X_val, y_val), evaluate_model(wrap, X_test, y_test)
+
+
+def tune_and_fit_xgboost_optuna(
+    X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS
+):
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.01, 0.2, log=True
+            ),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float(
+                "colsample_bytree", 0.6, 1.0
+            ),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        }
+        model = XGBRegressorWrapper(**params, random_state=RANDOM_STATE)
+        model.fit(X_train, y_train)
+        pred = model.predict(X_val)
+        return r2_score(y_val, pred)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    model = XGBRegressorWrapper(**best, random_state=RANDOM_STATE)
+    model.fit(X_train, y_train)
+    return (
+        model,
+        evaluate_model(model, X_val, y_val),
+        evaluate_model(model, X_test, y_test),
+    )
+
+
+def tune_and_fit_rf_optuna(
+    X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS
+):
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 200),
+            "max_depth": trial.suggest_int("max_depth", 5, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 20),
+        }
+        model = RandomForestRegressor(
+            **params, random_state=RANDOM_STATE, n_jobs=-1
+        )
+        model.fit(X_train, y_train)
+        return r2_score(y_val, model.predict(X_val))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    model = RandomForestRegressor(
+        **best, random_state=RANDOM_STATE, n_jobs=-1
+    )
+    model.fit(X_train, y_train)
+    return (
+        model,
+        evaluate_model(model, X_val, y_val),
+        evaluate_model(model, X_test, y_test),
+    )
+
+
+def run_optuna_models(
+    X_train, X_val, X_test, y_train, y_val, y_test
+):
+    """
+    Optuna-tuned versions of key models from Regression_optuna_all_features_changed2.py.
+    Returns a list like run_all_models: [(name, val_metrics, test_metrics), ...]
+    """
+    results = []
+
+    _, vm, tm = tune_and_fit_rf_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
+    results.append(("Random Forest (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_xgboost_optuna(
+        X_train, y_train, X_val, y_val, X_test, y_test
+    )
+    results.append(("XGBoost (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_keras_optuna(
+        X_train, y_train, X_val, y_val, X_test, y_test
+    )
+    results.append(("Keras (tuned)", vm, tm))
+
+    return results
 
 def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
     """Train each model; return results list."""
@@ -307,7 +541,246 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
             model.fit(X_train, y_train)
         results.append((name, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)))
     return results
+def run_classification_pipeline():
+    """
+    Classification pipeline from Final_classification (1).ipynb.
+    Uses engineered lags/rolls and humidity-merged dataset to predict
+    whether admissions >= THRESHOLD.
+    """
+    # --- 1. FEATURE ENGINEERING ---
+    def engineer_features(df):
+        df = df.copy()
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+        df = df.sort_values("Timestamp").reset_index(drop=True)
 
+        # Cyclical seasonality
+        df["dow_sin"] = np.sin(2 * np.pi * df["Timestamp"].dt.dayofweek / 7)
+        df["dow_cos"] = np.cos(2 * np.pi * df["Timestamp"].dt.dayofweek / 7)
+        df["month_sin"] = np.sin(2 * np.pi * df["Timestamp"].dt.month / 12)
+        df["month_cos"] = np.cos(2 * np.pi * df["Timestamp"].dt.month / 12)
+
+        # Regime indicators for seasonality and trend
+        df["month_regime"] = df["Timestamp"].dt.month
+        years = df["Timestamp"].dt.year
+        year_order = {year: i + 1 for i, year in enumerate(sorted(years.unique()))}
+        df["year_regime"] = years.map(year_order)
+        df["weekend"] = (df["Timestamp"].dt.dayofweek >= 5).astype(int)
+
+        if WIND_DIR_COL in df.columns:
+            df["wind_sin"] = np.sin(2 * np.pi * df[WIND_DIR_COL] / 360)
+            df["wind_cos"] = np.cos(2 * np.pi * df[WIND_DIR_COL] / 360)
+
+        exclude = ["Timestamp", TARGET_COL, WIND_DIR_COL, "Date"]
+        weather_cols = [
+            c
+            for c in df.columns
+            if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
+        ]
+
+        new_feats = {}
+        for col in weather_cols:
+            for lag in LAG_DAYS:
+                new_feats[f"{col}_lag{lag}"] = df[col].shift(lag)
+            for roll in ROLL_WINDOWS:
+                new_feats[f"{col}_roll{roll}"] = df[col].shift(1).rolling(roll).mean()
+
+        new_feats["admission_lag7"] = df[TARGET_COL].shift(7)
+
+        df = pd.concat([df, pd.DataFrame(new_feats)], axis=1)
+
+        all_nan_cols = [c for c in df.columns if df[c].isna().all()]
+        if all_nan_cols:
+            df = df.drop(columns=all_nan_cols)
+
+        df = df.dropna().reset_index(drop=True)
+        df["target_binary"] = (df[TARGET_COL] >= THRESHOLD).astype(int)
+        return df
+
+    # --- 2. TUNING LOGIC ---
+    def get_optuna_params(model_type, X_tr, y_tr, X_va, y_va):
+        def objective(trial):
+            if model_type == "rf":
+                p = {
+                    "n_estimators": trial.suggest_int("n_estimators", 50, 200),
+                    "max_depth": trial.suggest_int("max_depth", 5, 20),
+                }
+                model = RandomForestClassifier(
+                    **p, random_state=RANDOM_STATE, n_jobs=-1
+                )
+            elif model_type == "xgb":
+                p = {
+                    "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                    "max_depth": trial.suggest_int("max_depth", 3, 10),
+                    "learning_rate": trial.suggest_float(
+                        "learning_rate", 0.01, 0.2, log=True
+                    ),
+                }
+                model = xgb.XGBClassifier(
+                    **p, random_state=RANDOM_STATE, eval_metric="logloss"
+                )
+            else:
+                raise ValueError(f"Unknown model_type: {model_type}")
+
+            model.fit(X_tr, y_tr)
+            return f1_score(y_va, model.predict(X_va))
+
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=N_TRIALS)
+        return study.best_params
+
+    # --- 3. DATA LOADING & MERGE (WITH HUMIDITY) ---
+    # This version drops low-importance features + some pollutants (matching the notebook)
+    def load_merged_data():
+        base_df = pd.read_csv(
+            "/Users/suhaniagarwal/Downloads/all_features_data_changed_2.csv"
+        )
+
+        extra_weather = pd.read_csv(
+            "/Users/suhaniagarwal/Downloads/extra_weather_variables (csv).csv",
+            skiprows=3,
+            header=0,
+        )
+
+        # Keep only the date and the chosen humidity column
+        humidity_cols = ["time", "relative_humidity_2m_mean (%)"]
+        extra_humidity = extra_weather[humidity_cols].copy()
+
+        # Align date types for merge
+        base_df["Timestamp"] = pd.to_datetime(base_df["Timestamp"])
+        extra_humidity["time"] = pd.to_datetime(extra_humidity["time"])
+
+        merged = base_df.merge(
+            extra_humidity,
+            left_on="Timestamp",
+            right_on="time",
+            how="left",
+        )
+
+        # Drop the redundant merge key from extra_weather
+        merged = merged.drop(columns=["time"])
+
+        # Drop NOx as redundant nitrogen measure
+        if "NOx (ppb)" in merged.columns:
+            merged = merged.drop(columns=["NOx (ppb)"])
+
+        # Drop NH3
+        nh3_cols = [c for c in merged.columns if "NH3" in c]
+        if nh3_cols:
+            merged = merged.drop(columns=nh3_cols)
+
+        # Drop specified columns (only if present)
+        drop_cols = [
+            "O Xylene (µg/m³)",
+            "Eth-Benzene (µg/m³)",
+            "MP-Xylene (µg/m³)",
+            "AT (°C)",
+            "RH (%)",
+            "WS (m/s)",
+            "WD (deg)",
+            "RF (mm)",
+            "TOT-RF (mm)",
+            "SR (W/mt2)",
+            "BP (mmHg)",
+            "VWS (m/s)",
+            "Air Quality",
+            "Xylene (µg/m³)",
+            "SO2 (µg/m³)",
+            "Benzene (µg/m³)",
+            "wind_gusts_10m_max (km/h)",
+            "wind_speed_10m_max (km/h)",
+            "apparent_temperature_max (°C)",
+        ]
+        merged = merged.drop(columns=[c for c in drop_cols if c in merged.columns])
+
+        return merged
+
+    # --- 4. MAIN EVALUATION LOOP ---
+    df = engineer_features(load_merged_data())
+    feat_cols = [
+        c
+        for c in df.columns
+        if any(s in c for s in ["_lag", "_roll", "sin", "cos", "weekend", "regime"])
+    ]
+    X, y = df[feat_cols], df["target_binary"]
+
+    print(
+        f"Target distribution: {dict(y.value_counts())} "
+        f"(1 = admissions >= {THRESHOLD})"
+    )
+
+    tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+    fold_results = []
+    best_params = {}
+
+    last_y_test, last_y_preds = None, None
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        scaler = RobustScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+
+        if fold == 0:
+            print(f"Tuning Classification Models (Threshold: {THRESHOLD})...")
+            split = int(len(X_train_s) * 0.8)
+            for m in ["rf", "xgb"]:
+                best_params[m] = get_optuna_params(
+                    m,
+                    X_train_s[:split],
+                    y_train.iloc[:split],
+                    X_train_s[split:],
+                    y_train.iloc[split:],
+                )
+
+        models = {
+            "Dummy_Baseline": DummyClassifier(strategy="most_frequent"),
+            "LogisticRegression": LogisticRegressionCV(cv=5),
+            "RandomForest": RandomForestClassifier(
+                **best_params["rf"], random_state=RANDOM_STATE
+            ),
+            "XGBoost": xgb.XGBClassifier(
+                **best_params["xgb"],
+                random_state=RANDOM_STATE,
+                eval_metric="logloss",
+            ),
+            "SVM": SVC(probability=True),
+        }
+
+        scores = {}
+        for name, model in models.items():
+            model.fit(X_train_s, y_train)
+            preds = model.predict(X_test_s)
+
+            scores[f"{name}_Accuracy"] = accuracy_score(y_test, preds)
+            scores[f"{name}_F1"] = f1_score(y_test, preds)
+
+            if hasattr(model, "predict_proba"):
+                probs = model.predict_proba(X_test_s)[:, 1]
+                scores[f"{name}_AUC"] = roc_auc_score(y_test, probs)
+
+            if fold == N_SPLITS - 1 and name == "XGBoost":
+                last_y_test = y_test
+                last_y_preds = preds
+
+        fold_results.append(scores)
+        print(f"Fold {fold + 1} complete.")
+
+    # --- 5. OUTPUT ---
+    print(f"\nAverage Classification Metrics (Threshold >= {THRESHOLD}):")
+    print(pd.DataFrame(fold_results).mean())
+
+    cm = confusion_matrix(last_y_test, last_y_preds)
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=cm, display_labels=[f"< {THRESHOLD}", f">= {THRESHOLD}"]
+    )
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title(
+        f"XGBoost Confusion Matrix (Fold {N_SPLITS})\n"
+        f"Target: Admissions >= {THRESHOLD}"
+    )
+    plt.show()
 
 def main():
     df = load_data()
@@ -325,7 +798,9 @@ def main():
     print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
 
     results = run_all_models(X_train, X_val, X_test, y_train, y_val, y_test)
-
+    # Run Optuna-tuned models and append them to the comparison table
+    optuna_results = run_optuna_models(X_train, X_val, X_test, y_train, y_val, y_test)
+    results.extend(optuna_results)
     print("Model comparison (Validation | Test)")
     print("-" * 72)
     print(f"{'Model':<18} {'Val MAE':>8} {'Val RMSE':>8} {'Val R²':>8}  |  {'Test MAE':>8} {'Test RMSE':>8} {'Test R²':>8}")
