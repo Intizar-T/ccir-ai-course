@@ -89,9 +89,9 @@ def get_feature_columns(df):
 def load_data():
     """
     Regression: use all_features_data_changed_2.csv and apply
-    the regression-specific drop list (no classification-only drops).
+    the regression-specific drop list.
     """
-    # Main path (same as Optuna regression script)
+   
     path = "/Users/suhaniagarwal/Downloads/all_features_data_changed_2.csv"
     if not os.path.exists(path):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,12 +99,12 @@ def load_data():
 
     df = pd.read_csv(path)
 
-    # Ensure Date exists (for your existing feature_engineering)
+    
     if TIMESTAMP_COL in df.columns:
         df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
         df[DATE_COL] = df[TIMESTAMP_COL].dt.normalize()
 
-    # --- Regression drop list (exactly from Regression_optuna_all_features_changed2.py) ---
+    # --- Regression drop list  ---
     drop_exact = [
         "wind_speed_10m_max (km/h)",
         "temperature_2m_min (°C)",
@@ -119,13 +119,13 @@ def load_data():
     ]
     df = df.drop(columns=[c for c in drop_exact if c in df.columns])
 
-    # NOx / NH3 removals (as in Optuna script)
+    # NOx / NH3 removals 
     nh3_cols = [c for c in df.columns if "NH3" in c]
     nox_cols = [c for c in df.columns if "NOx" in c]
     if nh3_cols or nox_cols:
         df = df.drop(columns=list(set(nh3_cols + nox_cols)))
 
-    # Keep behavior consistent with original regression (no Timestamp column afterwards)
+   
     if TIMESTAMP_COL in df.columns:
         df = df.drop(columns=[TIMESTAMP_COL])
 
@@ -674,7 +674,7 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
     return results
 def run_classification_pipeline():
     """
-    Classification pipeline from Final_classification (1).ipynb.
+    
     Uses engineered lags/rolls and humidity-merged dataset to predict
     whether admissions >= THRESHOLD.
     """
@@ -760,7 +760,7 @@ def run_classification_pipeline():
         return study.best_params
 
     # --- 3. DATA LOADING & MERGE (WITH HUMIDITY) ---
-    # This version drops low-importance features + some pollutants (matching the notebook)
+    # This version drops low-importance features + some pollutants 
     def load_merged_data():
         base_df = pd.read_csv(
             "/Users/suhaniagarwal/Downloads/all_features_data_changed_2.csv"
@@ -928,7 +928,7 @@ def main():
     print(f"  Time-series CV folds: {N_SPLITS}\n")
 
     # 5-fold time-aware CV for regression (includes Optuna-tuned models)
-    run_regression_cv(df)
+    run_regression_time_series_cv(df)
 
 
 if __name__ == "__main__":
@@ -936,6 +936,5 @@ if __name__ == "__main__":
     main()
 
     # Classification (binary, threshold = THRESHOLD)
-    # Uncomment this line when you also want to run the classification pipeline:
 
     run_classification_pipeline()
