@@ -57,7 +57,7 @@ TARGET_COL = "Number of Admissions"
 TIME_FEATURES = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
 # Extra configuration for Optuna tuning and classification
 THRESHOLD = 20           # admissions threshold for binary classification
-N_SPLITS = 5             # time-series CV splits for classification
+N_SPLITS = 5             # time-series CV splits 
 N_TRIALS = 25            # Optuna trials per tunable model
 RANDOM_STATE = 42
 WIND_DIR_COL = "wind_direction_10m_dominant (°)"
@@ -87,11 +87,7 @@ def get_feature_columns(df):
 
 
 def load_data():
-    """
-    Regression: use all_features_data_changed_2.csv and apply
-    the regression-specific drop list.
-    """
-   
+    
     path = "/Users/suhaniagarwal/Downloads/all_features_data_changed_2.csv"
     if not os.path.exists(path):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,12 +95,36 @@ def load_data():
 
     df = pd.read_csv(path)
 
-    
+    # Ensure DATE_COL exists (from Timestamp or from Date) — regression uses Date only
     if TIMESTAMP_COL in df.columns:
         df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
         df[DATE_COL] = df[TIMESTAMP_COL].dt.normalize()
+    elif DATE_COL in df.columns:
+        df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
 
-    # --- Regression drop list  ---
+    # Humidity merge uses DATE_COL only (does not require Timestamp on df)
+    _extra_path = "/Users/suhaniagarwal/Downloads/extra_weather_variables (csv).csv"
+    _humidity_cols = [
+        "relative_humidity_2m_mean (%)",
+        "relative_humidity_2m_max (%)",
+        "relative_humidity_2m_min (%)",
+    ]
+    if os.path.exists(_extra_path):
+        _extra = pd.read_csv(_extra_path, skiprows=3, header=0)
+        _to_add = [c for c in _humidity_cols if c in _extra.columns and c not in df.columns]
+        if _to_add:
+            _extra_sub = _extra[["time"] + _to_add].copy()
+            _extra_sub["time"] = pd.to_datetime(_extra_sub["time"], errors="coerce")
+            _extra_sub["_date"] = _extra_sub["time"].dt.normalize()
+            df = df.merge(
+                _extra_sub.drop(columns=["time"]).rename(columns={"_date": "_merge_date"}),
+                left_on=DATE_COL,
+                right_on="_merge_date",
+                how="left",
+            )
+            df = df.drop(columns=["_merge_date"], errors="ignore")
+
+    # Regression drop list
     drop_exact = [
         "wind_speed_10m_max (km/h)",
         "temperature_2m_min (°C)",
@@ -119,13 +139,12 @@ def load_data():
     ]
     df = df.drop(columns=[c for c in drop_exact if c in df.columns])
 
-    # NOx / NH3 removals 
     nh3_cols = [c for c in df.columns if "NH3" in c]
     nox_cols = [c for c in df.columns if "NOx" in c]
     if nh3_cols or nox_cols:
         df = df.drop(columns=list(set(nh3_cols + nox_cols)))
 
-   
+    # Regression keeps only Date; drop Timestamp if present
     if TIMESTAMP_COL in df.columns:
         df = df.drop(columns=[TIMESTAMP_COL])
 
@@ -528,27 +547,157 @@ def tune_and_fit_rf_optuna(
         evaluate_model(model, X_test, y_test),
     )
 
+def tune_and_fit_gbm_optuna(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS):
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+            "max_depth": trial.suggest_int("max_depth", 2, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 30),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+        }
+        model = GradientBoostingRegressor(**params, random_state=RANDOM_STATE)
+        model.fit(X_train, y_train)
+        return r2_score(y_val, model.predict(X_val))
 
-def run_optuna_models(
-    X_train, X_val, X_test, y_train, y_val, y_test
-):
-    """
-    Optuna-tuned versions of key models from Regression_optuna_all_features_changed2.py.
-    Returns a list like run_all_models: [(name, val_metrics, test_metrics), ...]
-    """
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    model = GradientBoostingRegressor(**best, random_state=RANDOM_STATE)
+    model.fit(X_train, y_train)
+    return model, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)
+
+
+def tune_and_fit_histgb_optuna(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS):
+    def objective(trial):
+        params = {
+            "max_iter": trial.suggest_int("max_iter", 50, 250),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 30),
+        }
+        model = HistGradientBoostingRegressor(**params, random_state=RANDOM_STATE)
+        model.fit(X_train, y_train)
+        return r2_score(y_val, model.predict(X_val))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    model = HistGradientBoostingRegressor(**best, random_state=RANDOM_STATE)
+    model.fit(X_train, y_train)
+    return model, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)
+
+
+def tune_and_fit_extra_trees_optuna(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS):
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 250),
+            "max_depth": trial.suggest_int("max_depth", 5, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 15),
+        }
+        model = ExtraTreesRegressor(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        model.fit(X_train, y_train)
+        return r2_score(y_val, model.predict(X_val))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    model = ExtraTreesRegressor(**best, random_state=RANDOM_STATE, n_jobs=-1)
+    model.fit(X_train, y_train)
+    return model, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)
+
+
+def tune_and_fit_svr_optuna(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS):
+    def objective(trial):
+        C = trial.suggest_float("C", 0.1, 100.0, log=True)
+        epsilon = trial.suggest_float("epsilon", 0.01, 1.0)
+        kernel = trial.suggest_categorical("kernel", ["rbf", "poly"])
+        model = SVR(C=C, epsilon=epsilon, kernel=kernel)
+        model.fit(X_train, y_train)
+        return r2_score(y_val, model.predict(X_val))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    model = SVR(**best)
+    model.fit(X_train, y_train)
+    return model, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)
+
+
+def tune_and_fit_mlp_optuna(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_TRIALS):
+    def objective(trial):
+        n_layers = trial.suggest_int("n_layers", 1, 3)
+        units = []
+        for i in range(n_layers):
+            units.append(trial.suggest_int(f"units_{i}", 16, 128))
+        alpha = trial.suggest_float("alpha", 1e-5, 1e-2, log=True)
+        lr = trial.suggest_float("learning_rate_init", 1e-4, 1e-2, log=True)
+        model = MLPRegressor(
+            hidden_layer_sizes=tuple(units),
+            activation="relu",
+            solver="adam",
+            alpha=alpha,
+            learning_rate_init=lr,
+            max_iter=1000,
+            random_state=RANDOM_STATE,
+        )
+        model.fit(X_train, y_train)
+        return r2_score(y_val, model.predict(X_val))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    n_layers = best.pop("n_layers")
+    units = [best.pop(f"units_{i}") for i in range(n_layers)]
+    best["hidden_layer_sizes"] = tuple(units)
+    best["activation"] = "relu"
+    best["solver"] = "adam"
+    best["max_iter"] = 1000
+    best["random_state"] = RANDOM_STATE
+    model = MLPRegressor(**best)
+    model.fit(X_train, y_train)
+    return model, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)
+
+def run_optuna_models(X_train, X_val, X_test, y_train, y_val, y_test):
     results = []
 
     _, vm, tm = tune_and_fit_rf_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
     results.append(("Random Forest (tuned)", vm, tm))
 
-    _, vm, tm = tune_and_fit_xgboost_optuna(
-        X_train, y_train, X_val, y_val, X_test, y_test
-    )
+    _, vm, tm = tune_and_fit_gbm_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
+    results.append(("Gradient Boosting (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_histgb_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
+    results.append(("Hist Gradient Boosting (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_extra_trees_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
+    results.append(("Extra Trees (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_xgboost_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
     results.append(("XGBoost (tuned)", vm, tm))
 
-    _, vm, tm = tune_and_fit_keras_optuna(
-        X_train, y_train, X_val, y_val, X_test, y_test
-    )
+    _, vm, tm = tune_and_fit_svr_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
+    results.append(("SVR (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_mlp_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
+    results.append(("FNN (MLP) (tuned)", vm, tm))
+
+    _, vm, tm = tune_and_fit_keras_optuna(X_train, y_train, X_val, y_val, X_test, y_test)
     results.append(("Keras (tuned)", vm, tm))
 
     return results
@@ -772,8 +921,16 @@ def run_classification_pipeline():
             header=0,
         )
 
-        # Keep only the date and the chosen humidity column
-        humidity_cols = ["time", "relative_humidity_2m_mean (%)"]
+        # Merge all 3 humidity columns from extra weather
+        humidity_cols = [
+            "time",
+            "relative_humidity_2m_mean (%)",
+            "relative_humidity_2m_max (%)",
+            "relative_humidity_2m_min (%)",
+        ]
+        humidity_cols = [c for c in humidity_cols if c in extra_weather.columns]
+        if not humidity_cols:
+            humidity_cols = ["time"]
         extra_humidity = extra_weather[humidity_cols].copy()
 
         # Align date types for merge
