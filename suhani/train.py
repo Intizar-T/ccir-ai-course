@@ -902,17 +902,7 @@ def run_classification_pipeline():
                 model = xgb.XGBClassifier(
                     **p, random_state=RANDOM_STATE, eval_metric="logloss"
                 )
-                        elif model_type == "xgb":
-                p = {
-                    "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                    "max_depth": trial.suggest_int("max_depth", 3, 10),
-                    "learning_rate": trial.suggest_float(
-                        "learning_rate", 0.01, 0.2, log=True
-                    ),
-                }
-                model = xgb.XGBClassifier(
-                    **p, random_state=RANDOM_STATE, eval_metric="logloss"
-                )
+                        
             elif model_type == "svm":
                 p = {
                     "C": trial.suggest_float("C", 0.01, 100.0, log=True),
@@ -923,8 +913,7 @@ def run_classification_pipeline():
                 model = SVC(probability=True, **p, random_state=RANDOM_STATE)
             else:
                 raise ValueError(f"Unknown model_type: {model_type}")
-            else:
-                raise ValueError(f"Unknown model_type: {model_type}")
+           
 
             model.fit(X_tr, y_tr)
             return f1_score(y_va, model.predict(X_va))
