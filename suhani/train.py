@@ -227,6 +227,8 @@ def training_data_split(df, train_frac=None, val_frac=None, test_frac=None, use_
         raise ValueError("No feature columns found in df.")
     X = df[feat_cols].astype(float)
     y = df[TARGET_COL]
+    if isinstance(y, pd.DataFrame):
+        y = y.squeeze(axis=1)
     n = len(df)
     if use_random:
         train_ix, val_ix, test_ix = _random_split_indices(n, train_frac, val_frac, test_frac)
@@ -369,7 +371,7 @@ class XGBRegressorWrapper(xgb.XGBRegressor):
 
     def fit(self, X, y, *args, **kwargs):
         X_arr = np.asarray(X, dtype=np.float32)
-        y_arr = np.asarray(y, dtype=np.float32)
+        y_arr = np.asarray(y, dtype=np.float32).ravel()  # XGBoost expects 1D labels, not DataFrame/2D        
         return super().fit(X_arr, y_arr, *args, **kwargs)
 
     def predict(self, X, *args, **kwargs):
@@ -712,6 +714,8 @@ def run_regression_time_series_cv(df, n_splits=N_SPLITS):
 
     X = df[feat_cols].astype(float)
     y = df[TARGET_COL]
+    if isinstance(y, pd.DataFrame):
+        y = y.squeeze(axis=1)
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     results_per_model = {}  # name -> {"val": [dict], "test": [dict]}
@@ -810,7 +814,7 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
         ("Extra Trees", extra_trees_model()),
         ("FNN (MLP)", fnn_model()),
         ("SVR", svm_model()),
-        ("XGBoost", xgboost_model()),
+        ("XGBoost", XGBRegressorWrapper(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=RANDOM_STATE)),
         ("Keras", KerasRegressorWrapper(epochs=200, patience=15)),
     ]
     results = []
@@ -898,8 +902,18 @@ def run_classification_pipeline():
                 model = xgb.XGBClassifier(
                     **p, random_state=RANDOM_STATE, eval_metric="logloss"
                 )
+                        
+            elif model_type == "svm":
+                p = {
+                    "C": trial.suggest_float("C", 0.01, 100.0, log=True),
+                    "kernel": trial.suggest_categorical("kernel", ["rbf", "poly", "linear"]),
+                    "gamma": trial.suggest_float("gamma", 1e-4, 10.0, log=True),
+                    "degree": trial.suggest_int("degree", 2, 5),
+                }
+                model = SVC(probability=True, **p, random_state=RANDOM_STATE)
             else:
                 raise ValueError(f"Unknown model_type: {model_type}")
+           
 
             model.fit(X_tr, y_tr)
             return f1_score(y_va, model.predict(X_va))
@@ -1013,7 +1027,7 @@ def run_classification_pipeline():
         if fold == 0:
             print(f"Tuning Classification Models (Threshold: {THRESHOLD})...")
             split = int(len(X_train_s) * 0.8)
-            for m in ["rf", "xgb"]:
+            for m in ["rf", "xgb", "svm"]:
                 best_params[m] = get_optuna_params(
                     m,
                     X_train_s[:split],
@@ -1033,7 +1047,7 @@ def run_classification_pipeline():
                 random_state=RANDOM_STATE,
                 eval_metric="logloss",
             ),
-            "SVM": SVC(probability=True),
+            "SVM": SVC(probability=True, **best_params["svm"], random_state=RANDOM_STATE),
         }
 
         scores = {}
