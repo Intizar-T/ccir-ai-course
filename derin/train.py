@@ -7,7 +7,7 @@ Hyperopt (20 trials) maximizes validation R²; best model is retrained and evalu
 import os
 import random
 
-# Force CPU for reliable, fast runs (Metal on M1 can be slower/stuck for small LSTMs).
+# Force CPU for reliable, fast runs
 if os.environ.get("VANILLA_LSTM_CPU", "1").lower() in ("1", "true", "yes"):
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")
@@ -16,7 +16,11 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from hmmlearn.hmm import GaussianHMM
+
 from keras.models import Sequential
 from keras.layers import LSTM, Dense, Dropout
 from keras.regularizers import L2
@@ -24,20 +28,21 @@ from keras.callbacks import EarlyStopping
 from keras.optimizers import Adam
 from keras import backend as K
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import warnings
+
+warnings.filterwarnings("ignore")
 
 # --- CONFIGURATION ---
-FORECAST_HORIZON = 21   # Model predicts the cumulative return over the NEXT 21 days
+FORECAST_HORIZON = 21   
 TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 SEED = 42
 HYPEROPT_TRIALS = 20
 
-# Columns used for regime clustering (same as LSTM features, no target).
-REGIME_FEATURE_COLS = ['SPY_Returns', 'FFR_Lagged', 'VIX_Close', 'CPI_YoY', 'IWM_Returns']
-BASE_FEATURE_COLS = ['SPY_Returns', 'FFR_Lagged', 'VIX_Close', 'CPI_YoY', 'IWM_Returns']
+REGIME_FEATURE_COLS =['SPY_Returns', 'FFR_Lagged', 'VIX_Close', 'CPI_YoY', 'IWM_Returns']
+BASE_FEATURE_COLS =['SPY_Returns', 'FFR_Lagged', 'VIX_Close', 'CPI_YoY', 'IWM_Returns']
 
-# Set by run_pipeline_with_regime so objective() loads the regime dataset.
 _CURRENT_DATA_PATH = None
 
 
@@ -51,9 +56,8 @@ def set_seed(seed=SEED):
 
 
 def process_data(file_path=None):
-    """Load the dataset and handle dates. If file_path is None, uses data/spy.csv."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    path = file_path or os.path.join(script_dir, 'data/spy.csv')
+    path = file_path or os.path.join(script_dir, 'data', 'spy.csv')
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing {path}")
     df = pd.read_csv(path)
@@ -63,82 +67,110 @@ def process_data(file_path=None):
 
 
 def add_regime_kmeans(df, n_clusters=3, train_frac=TRAIN_FRAC, random_state=SEED):
-    """
-    Fit KMeans on train portion of regime features, assign regime label to every row.
-    Returns df with new column 'regime' (0 .. n_clusters-1). No leakage: fit on train only.
-    """
     set_seed(random_state)
-    cols = [c for c in REGIME_FEATURE_COLS if c in df.columns]
-    if len(cols) < 2:
-        raise ValueError(f"Need at least 2 of {REGIME_FEATURE_COLS} for regime clustering")
+    cols =[c for c in REGIME_FEATURE_COLS if c in df.columns]
     train_end = int(len(df) * train_frac)
     X = df[cols].values
     scaler = StandardScaler()
-    scaler.fit(X[:train_end])
-    X_scaled = scaler.transform(X)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
-    kmeans.fit(X_scaled[:train_end])
+    X_scaled = scaler.fit_transform(X[:train_end])
+    X_full_scaled = scaler.transform(X)
+    
+    kmeans = KMeans(n_clusters=int(n_clusters), random_state=random_state, n_init=10)
+    kmeans.fit(X_scaled)
     df = df.copy()
-    df['regime'] = kmeans.predict(X_scaled)
+    df['regime'] = kmeans.predict(X_full_scaled)
     return df
 
 
-from sklearn.mixture import GaussianMixture
-
-def add_regime_gmm(df, n_components=3, train_frac=TRAIN_FRAC, random_state=SEED):
-    """
-    Fit GMM on the training portion and assign regime labels to the whole dataset.
-    """
+def add_regime_gmm(df, n_components='auto', train_frac=TRAIN_FRAC, random_state=SEED):
     set_seed(random_state)
-    cols = [c for c in REGIME_FEATURE_COLS if c in df.columns]
-    
+    cols =[c for c in REGIME_FEATURE_COLS if c in df.columns]
     train_end = int(len(df) * train_frac)
     X = df[cols].values
     
-    # Scale based ONLY on training data to prevent leakage
     scaler = StandardScaler()
-    scaler.fit(X[:train_end])
-    X_scaled = scaler.transform(X)
+    X_scaled = scaler.fit_transform(X[:train_end])
+    X_full_scaled = scaler.transform(X)
     
-    # Initialize and Fit GMM
-    gmm = GaussianMixture(
-        n_components=n_components, 
-        covariance_type='full', 
-        random_state=random_state, 
-        n_init=10
-    )
-    gmm.fit(X_scaled[:train_end])
-    
+    if str(n_components).lower() == 'auto':
+        print("Optimizing GMM states using BIC...")
+        best_bic = np.inf
+        best_n = 2
+        for n in range(2, 10):
+            try:
+                gmm = GaussianMixture(n_components=n, covariance_type='full', random_state=random_state, n_init=5)
+                gmm.fit(X_scaled)
+                bic = gmm.bic(X_scaled)
+                if bic < best_bic:
+                    best_bic = bic
+                    best_n = n
+            except:
+                pass
+        n_components = best_n
+        print(f"✅ Optimal GMM states chosen by BIC: {n_components}")
+    else:
+        n_components = int(n_components)
+        
+    gmm = GaussianMixture(n_components=n_components, covariance_type='full', random_state=random_state, n_init=10)
+    gmm.fit(X_scaled)
     df = df.copy()
-    # Assign the most likely regime label (hard clustering)
-    df['regime'] = gmm.predict(X_scaled)
-    
-    # OPTIONAL ADVANCED STEP: 
-    # You could also add the 'probabilities' of each regime as features,
-    # but for now, we will use the labels to keep it comparable to K-Means.
-    
+    df['regime'] = gmm.predict(X_full_scaled)
     return df
 
 
-def add_regime_hmm(df, n_components=3, train_frac=TRAIN_FRAC, random_state=SEED):
-    """Stub for HMM regime detection. To be implemented."""
-    raise NotImplementedError("HMM regime not implemented yet; use regime_detector='kmeans'.")
+def add_regime_hmm(df, n_components='auto', train_frac=TRAIN_FRAC, random_state=SEED):
+    set_seed(random_state)
+    cols =[c for c in REGIME_FEATURE_COLS if c in df.columns]
+    train_end = int(len(df) * train_frac)
+    X = df[cols].values
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X[:train_end])
+    X_full_scaled = scaler.transform(X)
+    
+    if str(n_components).lower() == 'auto':
+        print("Optimizing HMM states using BIC...")
+        best_bic = np.inf
+        best_n = 2
+        for n in range(2, 10):
+            try:
+                model = GaussianHMM(n_components=n, covariance_type='full', n_iter=100, random_state=random_state)
+                model.fit(X_scaled)
+                logL = model.score(X_scaled)
+                n_features = X_scaled.shape[1]
+                p = n*(n-1) + (n-1) + n*n_features + n*n_features*(n_features+1)/2
+                bic = -2 * logL + p * np.log(len(X_scaled))
+                
+                if bic < best_bic:
+                    best_bic = bic
+                    best_n = n
+            except:
+                pass
+        n_components = best_n
+        print(f"✅ Optimal HMM states chosen by BIC: {n_components}")
+    else:
+        n_components = int(n_components)
+        
+    model = GaussianHMM(n_components=n_components, covariance_type='full', n_iter=500, random_state=random_state)
+    model.fit(X_scaled)
+    df = df.copy()
+    df['regime'] = model.predict(X_full_scaled)
+    return df
 
 
 def add_regime_and_save(df, regime_detector='kmeans', output_path=None, **kwargs):
-    """
-    Add regime column using the given detector (kmeans/gmm/hmm) and save the dataset.
-    Returns df with 'regime' column. Saves to output_path if provided.
-    """
     if regime_detector == 'kmeans':
         n_clusters = kwargs.get('n_clusters', 3)
         df = add_regime_kmeans(df, n_clusters=n_clusters, **{k: v for k, v in kwargs.items() if k in ('train_frac', 'random_state')})
     elif regime_detector == 'gmm':
-        df = add_regime_gmm(df, **kwargs)
+        n_clusters = kwargs.get('n_clusters', 'auto')
+        df = add_regime_gmm(df, n_components=n_clusters, **{k: v for k, v in kwargs.items() if k in ('train_frac', 'random_state')})
     elif regime_detector == 'hmm':
-        df = add_regime_hmm(df, **kwargs)
+        n_clusters = kwargs.get('n_clusters', 'auto')
+        df = add_regime_hmm(df, n_components=n_clusters, **{k: v for k, v in kwargs.items() if k in ('train_frac', 'random_state')})
     else:
-        raise ValueError(f"Unknown regime_detector: {regime_detector}. Use 'kmeans', 'gmm', or 'hmm'.")
+        raise ValueError(f"Unknown regime_detector: {regime_detector}.")
+    
     if output_path:
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         df.to_csv(output_path)
@@ -146,11 +178,6 @@ def add_regime_and_save(df, regime_detector='kmeans', output_path=None, **kwargs
 
 
 def encode_scalar_regime_to_onehot(df):
-    """
-    Replace integer column 'regime' (0..K-1) with one-hot columns regime_0..regime_{K-1}.
-    Only for scalar regime (e.g. KMeans/GMM/HMM hard labels). No scaling applied to these.
-    If 'regime' not in df, returns df unchanged.
-    """
     if 'regime' not in df.columns:
         return df
     df = df.copy()
@@ -162,7 +189,6 @@ def encode_scalar_regime_to_onehot(df):
 
 
 def feature_engineering(df):
-    """Creates the 21-day forward target (no scaling). feature_cols = base + any regime_* columns (generic)."""
     indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=FORECAST_HORIZON)
     df['Target_21d'] = df['SPY_Returns'].rolling(window=indexer).sum().shift(-1)
     df.dropna(inplace=True)
@@ -173,8 +199,7 @@ def feature_engineering(df):
 
 
 def create_sequences(X, y, window_size):
-    """X: (samples, features), y: 1d. Returns 3D X for LSTM and 1d y."""
-    Xs, ys = [], []
+    Xs, ys = [],[]
     for i in range(len(X) - window_size):
         Xs.append(X[i:(i + window_size)])
         ys.append(y[i + window_size - 1])
@@ -182,35 +207,36 @@ def create_sequences(X, y, window_size):
 
 
 def scale_and_split(df, feature_cols, input_window, scaler_class):
-    """
-    Scale only base feature columns (fit on train). Regime columns (regime_*) are not scaled.
-    y stays raw. scaler_class: StandardScaler or RobustScaler.
-    """
     N = len(df)
     train_end = int(N * TRAIN_FRAC)
     val_end = int(N * (TRAIN_FRAC + VAL_FRAC))
+    
     feature_cols_scale = [c for c in feature_cols if c in BASE_FEATURE_COLS]
     feature_cols_no_scale = [c for c in feature_cols if c not in BASE_FEATURE_COLS]
+    
     scaler_X = scaler_class()
     scaler_X.fit(df[feature_cols_scale].iloc[:train_end])
     X_scale = scaler_X.transform(df[feature_cols_scale])
     X_no_scale = df[feature_cols_no_scale].values if feature_cols_no_scale else np.empty((len(df), 0))
     X = np.hstack([X_scale, X_no_scale])
+    
     y_raw = df['Target_21d'].values.reshape(-1, 1)
     X_seq, y_seq = create_sequences(X, y_raw, input_window)
+    
     train_seq_end = train_end - input_window
     val_seq_end = val_end - input_window
+    
     X_train = X_seq[:train_seq_end]
     X_val = X_seq[train_seq_end:val_seq_end]
     X_test = X_seq[val_seq_end:]
     y_train = y_seq[:train_seq_end]
     y_val = y_seq[train_seq_end:val_seq_end]
     y_test = y_seq[val_seq_end:]
+    
     return X_train, X_val, X_test, y_train, y_val, y_test, scaler_X
 
 
 def build_model(input_shape, lstm_units_1, lstm_units_2, dropout, lr, l2):
-    """One or two LSTM layers; lstm_units_2=0 means single layer. L2 on Dense only."""
     reg = L2(l2) if l2 > 0 else None
     model = Sequential()
     if lstm_units_2 is None or lstm_units_2 <= 0:
@@ -226,7 +252,6 @@ def build_model(input_shape, lstm_units_1, lstm_units_2, dropout, lr, l2):
 
 
 def train_model(X_train, y_train, X_val, y_val, params, verbose=0):
-    """Train with early stopping. Returns model and validation R²."""
     set_seed(SEED)
     model = build_model(
         (X_train.shape[1], X_train.shape[2]),
@@ -236,18 +261,10 @@ def train_model(X_train, y_train, X_val, y_val, params, verbose=0):
         lr=params['lr'],
         l2=params['l2']
     )
-    early_stop = EarlyStopping(
-        monitor='val_loss',
-        patience=int(params['patience']),
-        restore_best_weights=True
-    )
+    early_stop = EarlyStopping(monitor='val_loss', patience=int(params['patience']), restore_best_weights=True)
     model.fit(
-        X_train, y_train,
-        epochs=60,
-        batch_size=int(params['batch_size']),
-        validation_data=(X_val, y_val),
-        callbacks=[early_stop],
-        verbose=verbose
+        X_train, y_train, epochs=60, batch_size=int(params['batch_size']),
+        validation_data=(X_val, y_val), callbacks=[early_stop], verbose=verbose
     )
     val_pred = model.predict(X_val, verbose=0)
     y_v = np.ravel(y_val)
@@ -258,45 +275,50 @@ def train_model(X_train, y_train, X_val, y_val, params, verbose=0):
     return model, val_r2
 
 
-def hyperopt_space():
-    return {
-        'input_window': hp.choice('input_window', [21, 42, 63]),
-        'scaler': hp.choice('scaler', ['robust', 'standard']),
-        'lstm_units_1': hp.choice('lstm_units_1', [32, 64, 128]),
-        'lstm_units_2': hp.choice('lstm_units_2', [0, 32, 64]),
-        'dropout': hp.uniform('dropout', 0.25, 0.5),
-        'l2': hp.loguniform('l2', np.log(1e-6), np.log(1e-2)),
-        'lr': hp.loguniform('lr', np.log(5e-4), np.log(5e-2)),
-        'batch_size': hp.choice('batch_size', [16, 32, 64]),
-        'patience': hp.choice('patience', [8, 12, 15]),
-    }
-
-
 def objective(params):
-    """Minimize negative validation R². Uses _CURRENT_DATA_PATH if set (regime pipeline)."""
     set_seed(SEED)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = _CURRENT_DATA_PATH or os.path.join(script_dir, 'data/spy.csv')
+    file_path = _CURRENT_DATA_PATH or os.path.join(script_dir, 'data', 'spy.csv')
     df = pd.read_csv(file_path)
     df['Date'] = pd.to_datetime(df['Date'])
     df.set_index('Date', inplace=True)
+    
     df = encode_scalar_regime_to_onehot(df)
     df, feature_cols = feature_engineering(df)
     scaler_class = RobustScaler if params['scaler'] == 'robust' else StandardScaler
+    
     try:
         X_train, X_val, X_test, y_train, y_val, y_test, _ = scale_and_split(
             df, feature_cols, params['input_window'], scaler_class
         )
-        _, val_r2 = train_model(X_train, y_train, X_val, y_val, params, verbose=0)
-        if np.isfinite(val_r2):
-            return {'loss': -val_r2, 'status': STATUS_OK}
-    except Exception:
+        
+        # --- 5-FOLD TIME SERIES CROSS VALIDATION ---
+        # Combine Train and Val for the CV splits
+        X_cv = np.concatenate((X_train, X_val), axis=0)
+        y_cv = np.concatenate((y_train, y_val), axis=0)
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        cv_scores =[]
+        
+        for tr_idx, v_idx in tscv.split(X_cv):
+            X_tr, X_v = X_cv[tr_idx], X_cv[v_idx]
+            y_tr, y_v = y_cv[tr_idx], y_cv[v_idx]
+            
+            _, val_r2 = train_model(X_tr, y_tr, X_v, y_v, params, verbose=0)
+            if np.isfinite(val_r2):
+                cv_scores.append(val_r2)
+            else:
+                cv_scores.append(-1.0)
+                
+        # Average R2 across all 5 folds
+        mean_cv_r2 = np.mean(cv_scores)
+        return {'loss': -mean_cv_r2, 'status': STATUS_OK}
+    except Exception as e:
         pass
     return {'loss': 0.0, 'status': STATUS_OK}
 
 
 def evaluate_and_print(model, X_test, y_test, y_train):
-    """Predictions are already in raw return space (no y scaling)."""
     y_pred = model.predict(X_test, verbose=0)
     y_act = np.ravel(y_test)
     y_pred = np.ravel(y_pred)
@@ -326,6 +348,20 @@ def evaluate_and_print(model, X_test, y_test, y_train):
     return r2
 
 
+def hyperopt_space():
+    return {
+        'input_window': hp.choice('input_window', [21, 42, 63]),
+        'scaler': hp.choice('scaler', ['robust', 'standard']),
+        'lstm_units_1': hp.choice('lstm_units_1', [32, 64, 128]),
+        'lstm_units_2': hp.choice('lstm_units_2',[0, 32, 64]),
+        'dropout': hp.uniform('dropout', 0.25, 0.5),
+        'l2': hp.loguniform('l2', np.log(1e-6), np.log(1e-2)),
+        'lr': hp.loguniform('lr', np.log(5e-4), np.log(5e-2)),
+        'batch_size': hp.choice('batch_size',[16, 32, 64]),
+        'patience': hp.choice('patience',[8, 12, 15]),
+    }
+
+
 def main():
     set_seed(SEED)
     print("Loading data...")
@@ -333,48 +369,30 @@ def main():
     print(f"Initial Shape: {df.shape}")
     df, feature_cols = feature_engineering(df)
 
-    # Hyperopt: 20 trials to maximize validation R²
     print(f"\nRunning Hyperopt ({HYPEROPT_TRIALS} trials) to maximize validation R²...")
     trials = Trials()
-    best = fmin(
-        fn=objective,
-        space=hyperopt_space(),
-        algo=tpe.suggest,
-        max_evals=HYPEROPT_TRIALS,
-        rstate=np.random.default_rng(SEED),
-        trials=trials,
-        verbose=1
-    )
-    # Map choice indices back to values
+    best = fmin(fn=objective, space=hyperopt_space(), algo=tpe.suggest, max_evals=HYPEROPT_TRIALS, rstate=np.random.default_rng(SEED), trials=trials, verbose=1)
+    
     input_windows = [21, 42, 63]
     scaler_names = ['robust', 'standard']
-    units_1 = [32, 64, 128]
+    units_1 =[32, 64, 128]
     units_2 = [0, 32, 64]
     batch_sizes = [16, 32, 64]
-    patiences = [8, 12, 15]
+    patiences =[8, 12, 15]
     best_params = {
-        'input_window': input_windows[best['input_window']],
-        'scaler': scaler_names[best['scaler']],
-        'lstm_units_1': units_1[best['lstm_units_1']],
-        'lstm_units_2': units_2[best['lstm_units_2']],
-        'dropout': best['dropout'],
-        'l2': float(best['l2']),
-        'lr': best['lr'],
-        'batch_size': batch_sizes[best['batch_size']],
-        'patience': patiences[best['patience']],
+        'input_window': input_windows[best['input_window']], 'scaler': scaler_names[best['scaler']],
+        'lstm_units_1': units_1[best['lstm_units_1']], 'lstm_units_2': units_2[best['lstm_units_2']],
+        'dropout': best['dropout'], 'l2': float(best['l2']), 'lr': best['lr'],
+        'batch_size': batch_sizes[best['batch_size']], 'patience': patiences[best['patience']],
     }
     print("\nBest hyperparameters:", best_params)
 
-    # Retrain best config with fixed seed and full verbose
     scaler_class = RobustScaler if best_params['scaler'] == 'robust' else StandardScaler
-    X_train, X_val, X_test, y_train, y_val, y_test, scaler_X = scale_and_split(
-        df, feature_cols, best_params['input_window'], scaler_class
-    )
-    print(f"\nSequence shapes: train {X_train.shape}, val {X_val.shape}, test {X_test.shape}")
+    X_train, X_val, X_test, y_train, y_val, y_test, scaler_X = scale_and_split(df, feature_cols, best_params['input_window'], scaler_class)
+    
+    print(f"\nRetraining final model on entire training set...")
     model, val_r2 = train_model(X_train, y_train, X_val, y_val, best_params, verbose=1)
-    print(f"Best validation R²: {val_r2:.4f}")
     test_r2 = evaluate_and_print(model, X_test, y_test, y_train)
-    print(f"\nTest R²: {test_r2:.4f}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(os.path.join(script_dir, 'model'), exist_ok=True)
@@ -382,105 +400,52 @@ def main():
     print("Model saved.")
 
 
-def run_pipeline_with_regime(
-    regime_detector='kmeans',
-    data_path=None,
-    n_clusters=3,
-    do_hyperopt=True,
-    **regime_kwargs
-):
-    """
-    Generic pipeline: add regime column (kmeans/gmm/hmm), save regime dataset, then run LSTM.
-    - regime_detector: 'kmeans', 'gmm', or 'hmm' (gmm/hmm stubbed for later).
-    - data_path: base CSV to load (default: data/spy.csv). Regime dataset is saved alongside.
-    - n_clusters / n_components: passed to the regime detector.
-    - do_hyperopt: if True, run Hyperopt then retrain best; else use default params and train once.
-    """
+def run_pipeline_with_regime(regime_detector='kmeans', data_path=None, do_hyperopt=True, **regime_kwargs):
     global _CURRENT_DATA_PATH
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    path = data_path or os.path.join(script_dir, 'data/spy.csv')
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing {path}")
-
+    path = data_path or os.path.join(script_dir, 'data', 'spy.csv')
     print(f"Loading data from {path}...")
     df = process_data(path)
-    print(f"Initial shape: {df.shape}")
-
-    # Add regime and save
+    
     base_name = os.path.splitext(os.path.basename(path))[0]
     out_dir = os.path.join(script_dir, 'data')
-    if regime_detector == 'kmeans':
-        output_path = os.path.join(out_dir, f"{base_name}_kmeans_regime.csv")
-        df = add_regime_and_save(df, regime_detector='kmeans', output_path=output_path, n_clusters=n_clusters, **regime_kwargs)
-        print(f"K-means regime added (n_clusters={n_clusters}). Saved to {output_path}")
-    elif regime_detector == 'gmm':
-        output_path = os.path.join(out_dir, f"{base_name}_gmm_regime.csv")
-        df = add_regime_and_save(df, regime_detector='gmm', output_path=output_path, n_components=regime_kwargs.get('n_components', 3), **regime_kwargs)
-        print(f"GMM regime added. Saved to {output_path}")
-    elif regime_detector == 'hmm':
-        output_path = os.path.join(out_dir, f"{base_name}_hmm_regime.csv")
-        df = add_regime_and_save(df, regime_detector='hmm', output_path=output_path, **regime_kwargs)
-        print(f"HMM regime added. Saved to {output_path}")
-    else:
-        raise ValueError(f"regime_detector must be 'kmeans', 'gmm', or 'hmm'; got {regime_detector}")
+    output_path = os.path.join(out_dir, f"{base_name}_{regime_detector}_regime.csv")
+    
+    df = add_regime_and_save(df, regime_detector=regime_detector, output_path=output_path, **regime_kwargs)
+    print(f"{regime_detector.upper()} regime added. Saved to {output_path}")
 
     df = encode_scalar_regime_to_onehot(df)
     _CURRENT_DATA_PATH = output_path
     df, feature_cols = feature_engineering(df)
-    print(f"Features (with regime): {feature_cols}")
+    print(f"Features (with one-hot regime): {feature_cols}")
 
     if do_hyperopt:
-        print(f"\nRunning Hyperopt ({HYPEROPT_TRIALS} trials) on regime dataset...")
+        print(f"\nRunning 5-Fold CV Hyperopt ({HYPEROPT_TRIALS} trials) on regime dataset...")
         trials = Trials()
-        best = fmin(
-            fn=objective,
-            space=hyperopt_space(),
-            algo=tpe.suggest,
-            max_evals=HYPEROPT_TRIALS,
-            rstate=np.random.default_rng(SEED),
-            trials=trials,
-            verbose=1
-        )
-        input_windows = [21, 42, 63]
+        best = fmin(fn=objective, space=hyperopt_space(), algo=tpe.suggest, max_evals=HYPEROPT_TRIALS, rstate=np.random.default_rng(SEED), trials=trials, verbose=1)
+        
+        input_windows =[21, 42, 63]
         scaler_names = ['robust', 'standard']
-        units_1 = [32, 64, 128]
-        units_2 = [0, 32, 64]
+        units_1 =[32, 64, 128]
+        units_2 =[0, 32, 64]
         batch_sizes = [16, 32, 64]
         patiences = [8, 12, 15]
         best_params = {
-            'input_window': input_windows[best['input_window']],
-            'scaler': scaler_names[best['scaler']],
-            'lstm_units_1': units_1[best['lstm_units_1']],
-            'lstm_units_2': units_2[best['lstm_units_2']],
-            'dropout': best['dropout'],
-            'l2': float(best['l2']),
-            'lr': best['lr'],
-            'batch_size': batch_sizes[best['batch_size']],
-            'patience': patiences[best['patience']],
+            'input_window': input_windows[best['input_window']], 'scaler': scaler_names[best['scaler']],
+            'lstm_units_1': units_1[best['lstm_units_1']], 'lstm_units_2': units_2[best['lstm_units_2']],
+            'dropout': best['dropout'], 'l2': float(best['l2']), 'lr': best['lr'],
+            'batch_size': batch_sizes[best['batch_size']], 'patience': patiences[best['patience']],
         }
         print("\nBest hyperparameters:", best_params)
     else:
-        best_params = {
-            'input_window': 21,
-            'scaler': 'standard',
-            'lstm_units_1': 64,
-            'lstm_units_2': 32,
-            'dropout': 0.3,
-            'l2': 1e-4,
-            'lr': 0.001,
-            'batch_size': 32,
-            'patience': 10,
-        }
+        best_params = {'input_window': 21, 'scaler': 'standard', 'lstm_units_1': 64, 'lstm_units_2': 32, 'dropout': 0.3, 'l2': 1e-4, 'lr': 0.001, 'batch_size': 32, 'patience': 10}
 
     scaler_class = RobustScaler if best_params['scaler'] == 'robust' else StandardScaler
-    X_train, X_val, X_test, y_train, y_val, y_test, scaler_X = scale_and_split(
-        df, feature_cols, best_params['input_window'], scaler_class
-    )
-    print(f"\nSequence shapes: train {X_train.shape}, val {X_val.shape}, test {X_test.shape}")
+    X_train, X_val, X_test, y_train, y_val, y_test, scaler_X = scale_and_split(df, feature_cols, best_params['input_window'], scaler_class)
+    
+    print(f"\nRetraining final optimized model...")
     model, val_r2 = train_model(X_train, y_train, X_val, y_val, best_params, verbose=1)
-    print(f"Validation R²: {val_r2:.4f}")
     test_r2 = evaluate_and_print(model, X_test, y_test, y_train)
-    print(f"\nTest R²: {test_r2:.4f}")
 
     os.makedirs(os.path.join(script_dir, 'model'), exist_ok=True)
     model_name = f"lstm_{regime_detector}_regime_21d.keras"
@@ -494,7 +459,13 @@ if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == '--regime':
         detector = sys.argv[2] if len(sys.argv) > 2 else 'kmeans'
-        n_clusters = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-        run_pipeline_with_regime(regime_detector=detector, n_clusters=n_clusters, do_hyperopt=True)
+        arg3 = sys.argv[3] if len(sys.argv) > 3 else '3'
+        
+        try:
+            param = int(arg3)
+        except ValueError:
+            param = arg3 # Captures 'auto'
+
+        run_pipeline_with_regime(regime_detector=detector, n_clusters=param, do_hyperopt=True)
     else:
         main()
