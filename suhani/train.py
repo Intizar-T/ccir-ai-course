@@ -860,8 +860,8 @@ def run_classification_pipeline():
         years = df["Timestamp"].dt.year
         year_order = {year: i + 1 for i, year in enumerate(sorted(years.unique()))}
         df["year_regime"] = years.map(year_order)
-        df["weekend"] = (df["Timestamp"].dt.dayofweek >= 5).astype(int)
-
+        df["weekend"] = (df["Timestamp"].dt.dayofweek >= 5).astype(np.float64)
+        
         if WIND_DIR_COL in df.columns:
             df["wind_sin"] = np.sin(2 * np.pi * df[WIND_DIR_COL] / 360)
             df["wind_cos"] = np.cos(2 * np.pi * df[WIND_DIR_COL] / 360)
