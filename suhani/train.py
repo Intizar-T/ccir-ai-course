@@ -187,7 +187,6 @@ def feature_engineering(df):
 
     raw_cols = get_raw_feature_columns(df)
 
-    raw_cols = get_raw_feature_columns(df)
     new_cols = {}
     lag_roll_cols = []
     for col in raw_cols:
