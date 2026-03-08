@@ -40,12 +40,6 @@ Useful but non-authoritative files:
 
 - `AGENTS.md`
   High-level project description, but parts of it are stale relative to the current code.
-- `YFINANCE_MIGRATION_SUMMARY.md`
-  Historical notes about moving market data loading from a static file to `yfinance`.
-- `Market Data Jan 25 2026.txt`
-  Legacy market data file. Present in the repo, but not used by the current Python pipeline.
-- `model_comparison_results.csv`
-  Legacy experiment output. The current `insidertradingtrain.py` does not generate this file.
 
 ## Current Repo Shape
 
@@ -419,12 +413,6 @@ Common generated artifacts include:
 - `features_with_labels.csv`
 - `market_prices_clean.csv`
 - `models/*.joblib`
-
-Current repo evidence also shows:
-
-- `model_comparison_results.csv`
-
-That file appears to come from an older experiment and is not produced by the current `insidertradingtrain.py`.
 
 ## Runtime Characteristics
 
