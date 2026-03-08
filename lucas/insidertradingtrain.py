@@ -11,7 +11,8 @@ from sklearn.svm import SVC
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, confusion_matrix, classification_report,
-    mean_absolute_error, mean_squared_error, r2_score
+    mean_absolute_error, mean_squared_error, r2_score,
+    average_precision_score
 )
 from scipy.stats import spearmanr
 from xgboost import XGBClassifier, XGBRegressor
@@ -611,9 +612,10 @@ def _build_stacking_classification(models, X_val, y_val, X_test, y_test):
     rec = recall_score(y_test, y_pred, zero_division=0)
     f1 = f1_score(y_test, y_pred, zero_division=0)
     auc = roc_auc_score(y_test, y_proba)
+    pr_auc = average_precision_score(y_test, y_proba)
     return {
         'accuracy': acc, 'precision': prec, 'recall': rec,
-        'f1': f1, 'roc_auc': auc,
+        'f1': f1, 'roc_auc': auc, 'pr_auc': pr_auc,
     }, meta
 
 
@@ -692,6 +694,7 @@ def evaluate_model(model, X_test, y_test, task='classification', threshold=None)
         rec = recall_score(y_test, y_pred, zero_division=0)
         f1 = f1_score(y_test, y_pred, zero_division=0)
         auc = roc_auc_score(y_test, y_proba) if y_proba is not None else float('nan')
+        pr_auc = average_precision_score(y_test, y_proba) if y_proba is not None else float('nan')
 
         thr_str = f" (threshold={threshold:.2f})" if threshold else ""
         print(f"  Accuracy : {acc:.4f}{thr_str}")
@@ -699,6 +702,7 @@ def evaluate_model(model, X_test, y_test, task='classification', threshold=None)
         print(f"  Recall   : {rec:.4f}")
         print(f"  F1       : {f1:.4f}")
         print(f"  ROC-AUC  : {auc:.4f}")
+        print(f"  PR-AUC   : {pr_auc:.4f}")
         print()
         print(classification_report(
             y_test, y_pred,
@@ -707,7 +711,7 @@ def evaluate_model(model, X_test, y_test, task='classification', threshold=None)
         print(f"  Confusion Matrix:\n{cm}\n")
 
         return {'accuracy': acc, 'precision': prec, 'recall': rec,
-                'f1': f1, 'roc_auc': auc}
+                'f1': f1, 'roc_auc': auc, 'pr_auc': pr_auc}
 
     else:
         y_pred = model.predict(X_test)
@@ -874,7 +878,8 @@ def main():
         stack_metrics, stack_meta = _build_stacking_classification(
             stackable, X_va, y_cls_va, X_te, y_cls_te)
         results_class['Stacking Ensemble'] = stack_metrics
-        print(f"  ROC-AUC={stack_metrics['roc_auc']:.4f}  "
+        print(f"  PR-AUC={stack_metrics.get('pr_auc', 0):.4f}  "
+              f"ROC-AUC={stack_metrics['roc_auc']:.4f}  "
               f"F1={stack_metrics['f1']:.4f}  Acc={stack_metrics['accuracy']:.4f}")
 
     # ==================================================================
@@ -938,16 +943,16 @@ def main():
     print("TRAINING COMPLETE – RESULTS SUMMARY")
     print("=" * 80)
 
-    print("\nClassification Models (sorted by ROC-AUC):")
+    print("\nClassification Models (sorted by PR-AUC):")
     for name, m in sorted(
         results_class.items(),
-        key=lambda x: x[1].get('roc_auc', 0)
-            if not np.isnan(x[1].get('roc_auc', 0)) else 0,
+        key=lambda x: x[1].get('pr_auc', 0)
+            if not np.isnan(x[1].get('pr_auc', 0)) else 0,
         reverse=True,
     ):
         thr = m.get('threshold', '')
         thr_s = f"  thr={thr}" if thr else ""
-        print(f"  {name:30s}  ROC-AUC={m.get('roc_auc', 0):.4f}  "
+        print(f"  {name:30s}  PR-AUC={m.get('pr_auc', 0):.4f}  ROC-AUC={m.get('roc_auc', 0):.4f}  "
               f"F1={m.get('f1', 0):.4f}  Acc={m.get('accuracy', 0):.4f}{thr_s}")
 
     print("\nRegression Models (sorted by R²):")

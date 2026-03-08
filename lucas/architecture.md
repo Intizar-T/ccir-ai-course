@@ -356,6 +356,7 @@ For classification, the script evaluates:
 - recall
 - F1
 - ROC-AUC
+- PR-AUC
 - confusion matrix
 - classification report
 
