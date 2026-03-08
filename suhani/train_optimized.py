@@ -2,6 +2,7 @@
 Optimized training: uses train.py pipeline (all_features_data, lags 1/3/7, roll 3/7, admission_lag7).
 - Ridge/ElasticNet/RidgeLog: built-in CV (RidgeCV/ElasticNetCV).
 - Tree/ensemble (RF, GBM, HistGB, ExtraTrees, XGBoost), SVR, MLP, Keras: Optuna.
+- TimeSeriesSplit CV + holdout test, reports MAE, RMSE, MAPE, R².
 """
 
 import numpy as np
@@ -12,25 +13,30 @@ from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import r2_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.svm import SVR
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers
 
-# Reuse data pipeline and config from train (single feature set)
 from train import (
     USE_IMPUTATION,
     load_data,
     preprocess_data,
     feature_engineering,
-    training_data_split,
+    cv_and_holdout_split,
     evaluate_model,
+    N_CV_FOLDS,
+    TEST_FRAC,
+    SCALER_TYPE,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-N_TRIALS = 25  # Optuna trials per tunable model
+N_TRIALS = 25       # Optuna trials for holdout training
+N_TRIALS_CV = 5     # Fewer trials per fold for CV (reduce if runtime too long)
 RANDOM_STATE = 42
 
 
@@ -233,6 +239,140 @@ def tune_and_fit_mlp(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=N_
     return model, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)
 
 
+def _run_fold_models(X_tr, y_tr, X_va, y_va, n_trials, inner_ts_cv=None):
+    """Run all models on one fold; return list of (name, val_metrics)."""
+    scaler_cls = RobustScaler if SCALER_TYPE == "robust" else StandardScaler
+    results = []
+
+    dummy = DummyRegressor(strategy="mean")
+    dummy.fit(X_tr, y_tr)
+    results.append(("Dummy (mean)", evaluate_model(dummy, X_va, y_va)))
+
+    ridge = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=inner_ts_cv or 5).fit(X_tr, y_tr)
+    results.append(("Ridge (CV)", evaluate_model(ridge, X_va, y_va)))
+
+    ridge_log = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=inner_ts_cv or 5)
+    ridge_log.fit(X_tr, np.log1p(y_tr))
+    pred_fn = _PredictorWrapper(lambda X: np.expm1(ridge_log.predict(X)))
+    results.append(("Ridge (log y)", evaluate_model(pred_fn, X_va, y_va)))
+
+    enet = ElasticNetCV(cv=inner_ts_cv or 5, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=np.logspace(-3, 1, 50), max_iter=5000).fit(X_tr, y_tr)
+    results.append(("ElasticNet (CV)", evaluate_model(enet, X_va, y_va)))
+
+    _, vm, _ = tune_and_fit_rf(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("Random Forest (tuned)", vm))
+    _, vm, _ = tune_and_fit_gbm(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("Gradient Boosting (tuned)", vm))
+    _, vm, _ = tune_and_fit_histgb(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("Hist Gradient Boosting (tuned)", vm))
+    _, vm, _ = tune_and_fit_extra_trees(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("Extra Trees (tuned)", vm))
+    _, vm, _ = tune_and_fit_xgboost(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("XGBoost (tuned)", vm))
+    _, vm, _ = tune_and_fit_svr(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("SVR (tuned)", vm))
+    _, vm, _ = tune_and_fit_mlp(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("FNN (MLP) (tuned)", vm))
+    _, vm, _ = tune_and_fit_keras(X_tr, y_tr, X_va, y_va, X_va, y_va, n_trials=n_trials)
+    results.append(("Keras (tuned)", vm))
+
+    return results
+
+
+def run_time_series_cv(X_cv, y_cv):
+    """Run TimeSeriesSplit CV; return list of (name, cv_metrics) with mean±std."""
+    tscv = TimeSeriesSplit(n_splits=N_CV_FOLDS)
+    scaler_cls = RobustScaler if SCALER_TYPE == "robust" else StandardScaler
+    model_names = [
+        "Dummy (mean)", "Ridge (CV)", "Ridge (log y)", "ElasticNet (CV)",
+        "Random Forest (tuned)", "Gradient Boosting (tuned)", "Hist Gradient Boosting (tuned)",
+        "Extra Trees (tuned)", "XGBoost (tuned)", "SVR (tuned)", "FNN (MLP) (tuned)", "Keras (tuned)",
+    ]
+    fold_results = {n: [] for n in model_names}
+
+    for fold, (train_ix, val_ix) in enumerate(tscv.split(X_cv)):
+        print(f"  CV fold {fold + 1}/{N_CV_FOLDS}...")
+        X_tr = X_cv[train_ix]
+        y_tr = y_cv[train_ix]
+        X_va = X_cv[val_ix]
+        y_va = y_cv[val_ix]
+        scaler = scaler_cls()
+        X_tr_sc = scaler.fit_transform(X_tr)
+        X_va_sc = scaler.transform(X_va)
+        inner_ts = (
+            TimeSeriesSplit(n_splits=min(3, len(train_ix) // 20))
+            if len(train_ix) >= 40
+            else None
+        )
+        fold_out = _run_fold_models(X_tr_sc, y_tr, X_va_sc, y_va, N_TRIALS_CV, inner_ts)
+        for name, m in fold_out:
+            fold_results[name].append(m)
+
+    cv_results = []
+    for name in model_names:
+        arr = fold_results[name]
+        means = {k: np.mean([a[k] for a in arr]) for k in arr[0]}
+        stds = {k: np.std([a[k] for a in arr]) for k in arr[0]}
+        cv_results.append((name, {k: (means[k], stds[k]) for k in means}))
+    return cv_results
+
+
+def run_holdout_evaluation(X_cv, y_cv, X_test, y_test):
+    """Train on full CV data, evaluate on holdout; return list of (name, test_metrics)."""
+    scaler_cls = RobustScaler if SCALER_TYPE == "robust" else StandardScaler
+    scaler = scaler_cls()
+    X_cv_sc = scaler.fit_transform(X_cv)
+    X_test_sc = scaler.transform(X_test)
+    inner_ts = (
+        TimeSeriesSplit(n_splits=min(3, len(X_cv) // 20))
+        if len(X_cv) >= 40
+        else None
+    )
+    n_val = max(1, len(X_cv) // 10)
+
+    results = []
+    dummy = DummyRegressor(strategy="mean")
+    dummy.fit(X_cv_sc, y_cv)
+    results.append(("Dummy (mean)", evaluate_model(dummy, X_test_sc, y_test)))
+
+    ridge = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=inner_ts or 5).fit(X_cv_sc, y_cv)
+    results.append(("Ridge (CV)", evaluate_model(ridge, X_test_sc, y_test)))
+
+    ridge_log = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=inner_ts or 5)
+    ridge_log.fit(X_cv_sc, np.log1p(y_cv))
+    results.append(("Ridge (log y)", evaluate_model(_PredictorWrapper(lambda X: np.expm1(ridge_log.predict(X))), X_test_sc, y_test)))
+
+    enet = ElasticNetCV(cv=inner_ts or 5, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=np.logspace(-3, 1, 50), max_iter=5000).fit(X_cv_sc, y_cv)
+    results.append(("ElasticNet (CV)", evaluate_model(enet, X_test_sc, y_test)))
+
+    print("  Tuning Random Forest...")
+    _, _, tm = tune_and_fit_rf(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("Random Forest (tuned)", tm))
+    print("  Tuning Gradient Boosting...")
+    _, _, tm = tune_and_fit_gbm(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("Gradient Boosting (tuned)", tm))
+    print("  Tuning Hist Gradient Boosting...")
+    _, _, tm = tune_and_fit_histgb(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("Hist Gradient Boosting (tuned)", tm))
+    print("  Tuning Extra Trees...")
+    _, _, tm = tune_and_fit_extra_trees(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("Extra Trees (tuned)", tm))
+    print("  Tuning XGBoost...")
+    _, _, tm = tune_and_fit_xgboost(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("XGBoost (tuned)", tm))
+    print("  Tuning SVR...")
+    _, _, tm = tune_and_fit_svr(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("SVR (tuned)", tm))
+    print("  Tuning FNN (MLP)...")
+    _, _, tm = tune_and_fit_mlp(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("FNN (MLP) (tuned)", tm))
+    print("  Tuning Keras...")
+    _, _, tm = tune_and_fit_keras(X_cv_sc, y_cv, X_cv_sc[-n_val:], y_cv[-n_val:], X_test_sc, y_test)
+    results.append(("Keras (tuned)", tm))
+
+    return results
+
+
 def main():
     df = load_data()
     n_load = len(df)
@@ -240,77 +380,64 @@ def main():
     n_pre = len(df)
     df = feature_engineering(df)
     n_fe = len(df)
-    X_train, X_val, X_test, y_train, y_val, y_test, _ = training_data_split(df)
+    X_cv, y_cv, X_test, y_test, feat_cols = cv_and_holdout_split(df)
 
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
-    print(f"  Features: {X_train.shape[1]} cols")
-    print(f"  Train / Val / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}\n")
-    print(f"Optuna: {N_TRIALS} trials per tunable model.\n")
+    print(f"  Features: {len(feat_cols)} cols")
+    print(f"  Split: TimeSeriesSplit({N_CV_FOLDS} folds) on CV | holdout test ({TEST_FRAC*100:.0f}%)")
+    print(f"  CV samples: {len(y_cv)} | Test samples: {len(y_test)}")
+    print(f"  Optuna: {N_TRIALS_CV} trials/fold (CV), {N_TRIALS} trials (holdout)\n")
 
-    results = []
+    print("Running TimeSeriesSplit CV (this may take a while)...")
+    cv_results = run_time_series_cv(X_cv, y_cv)
 
-    # No tuning
-    dummy = DummyRegressor(strategy="mean")
-    dummy.fit(X_train, y_train)
-    results.append(("Dummy (mean)", evaluate_model(dummy, X_val, y_val), evaluate_model(dummy, X_test, y_test)))
+    print("\nTraining on full CV data, evaluating on holdout...")
+    holdout_results = run_holdout_evaluation(X_cv, y_cv, X_test, y_test)
 
-    # Built-in CV (already optimal for linear models)
-    ridge = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=5).fit(X_train, y_train)
-    results.append(("Ridge (CV)", evaluate_model(ridge, X_val, y_val), evaluate_model(ridge, X_test, y_test)))
+    w = 150
+    print("\nModel comparison (CV mean ± std | Holdout test)")
+    print("-" * w)
+    header = (
+        f"{'Model':<28} | {'CV MAE':>12} {'CV RMSE':>12} {'CV MAPE%':>12} {'CV R²':>12}  |  "
+        f"{'Test MAE':>8} {'Test RMSE':>8} {'Test MAPE%':>9} {'Test R²':>8}"
+    )
+    print(header)
+    print("-" * w)
+    for (name, cv_m), (_, test_m) in zip(cv_results, holdout_results):
+        row = (
+            f"{name:<28} | {cv_m['mae'][0]:.4f}±{cv_m['mae'][1]:.4f} "
+            f"{cv_m['rmse'][0]:.4f}±{cv_m['rmse'][1]:.4f} "
+            f"{cv_m['mape'][0]:.2f}±{cv_m['mape'][1]:.2f} "
+            f"{cv_m['r2'][0]:.4f}±{cv_m['r2'][1]:.4f}  |  "
+            f"{test_m['mae']:>8.4f} {test_m['rmse']:>8.4f} {test_m['mape']:>9.2f} {test_m['r2']:>8.4f}"
+        )
+        print(row)
+    print("-" * w)
 
-    ridge_log = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=5)
-    ridge_log.fit(X_train, np.log1p(y_train))
-    def _ridge_log_predict(X):
-        return np.expm1(ridge_log.predict(X))
-    results.append(("Ridge (log y)", evaluate_model(_PredictorWrapper(_ridge_log_predict), X_val, y_val), evaluate_model(_PredictorWrapper(_ridge_log_predict), X_test, y_test)))
+    best_mae = min(holdout_results, key=lambda r: r[1]["mae"])
+    best_rmse = min(holdout_results, key=lambda r: r[1]["rmse"])
+    best_mape = min(holdout_results, key=lambda r: r[1]["mape"])
+    best_r2 = max(holdout_results, key=lambda r: r[1]["r2"])
 
-    enet = ElasticNetCV(cv=5, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=np.logspace(-3, 1, 50), max_iter=5000).fit(X_train, y_train)
-    results.append(("ElasticNet (CV)", evaluate_model(enet, X_val, y_val), evaluate_model(enet, X_test, y_test)))
+    print("\nBest by Holdout Test metric:")
+    print(f"  MAE:   {best_mae[0]:<28}  (MAE   = {best_mae[1]['mae']:.4f})")
+    print(f"  RMSE:  {best_rmse[0]:<28}  (RMSE  = {best_rmse[1]['rmse']:.4f})")
+    print(f"  MAPE:  {best_mape[0]:<28}  (MAPE  = {best_mape[1]['mape']:.2f}%)")
+    print(f"  R²:    {best_r2[0]:<28}  (R²    = {best_r2[1]['r2']:.4f})")
 
-    # Optuna-tuned models
-    print("Tuning Random Forest...")
-    _, vm, tm = tune_and_fit_rf(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("Random Forest (tuned)", vm, tm))
-
-    print("Tuning Gradient Boosting...")
-    _, vm, tm = tune_and_fit_gbm(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("Gradient Boosting (tuned)", vm, tm))
-
-    print("Tuning Hist Gradient Boosting...")
-    _, vm, tm = tune_and_fit_histgb(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("Hist Gradient Boosting (tuned)", vm, tm))
-
-    print("Tuning Extra Trees...")
-    _, vm, tm = tune_and_fit_extra_trees(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("Extra Trees (tuned)", vm, tm))
-
-    print("Tuning XGBoost...")
-    _, vm, tm = tune_and_fit_xgboost(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("XGBoost (tuned)", vm, tm))
-
-    print("Tuning SVR...")
-    _, vm, tm = tune_and_fit_svr(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("SVR (tuned)", vm, tm))
-
-    print("Tuning FNN (MLP)...")
-    _, vm, tm = tune_and_fit_mlp(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("FNN (MLP) (tuned)", vm, tm))
-
-    print("Tuning Keras...")
-    _, vm, tm = tune_and_fit_keras(X_train, y_train, X_val, y_val, X_test, y_test)
-    results.append(("Keras (tuned)", vm, tm))
-
-    print("\nModel comparison (Validation | Test)")
-    print("-" * 72)
-    print(f"{'Model':<28} {'Val MAE':>8} {'Val RMSE':>8} {'Val R²':>8}  |  {'Test MAE':>8} {'Test RMSE':>8} {'Test R²':>8}")
-    print("-" * 72)
-    for name, vm, tm in results:
-        print(f"{name:<28} {vm['mae']:>8.4f} {vm['rmse']:>8.4f} {vm['r2']:>8.4f}  |  {tm['mae']:>8.4f} {tm['rmse']:>8.4f} {tm['r2']:>8.4f}")
-    print("-" * 72)
-
-    best_name, _, best_test = max(results, key=lambda r: r[2]["r2"])
-    print(f"\nBest by Test R²: {best_name}  (R² = {best_test['r2']:.4f})")
+    print("\n" + "=" * 60)
+    print("Literature comparison (air quality + weather → admissions)")
+    print("=" * 60)
+    print("  npj Digital Medicine (2022), ED admissions:")
+    print("    MAE 4.0 (17% error) vs benchmark 6.5 (32%)")
+    print("  Nature Sci Rep (2023), German ER visits:")
+    print("    Air+weather explained ~6% of variance (mobility ~63%)")
+    print("  Multi-city air pollution–mortality:")
+    print("    R² typically <1%–13% for environmental predictors")
+    print("-" * 60)
+    print("  This study (Optuna-tuned, TimeSeriesSplit CV):")
+    print(f"    Test MAE  {best_mae[1]['mae']:.2f}  |  Test MAPE  {best_mape[1]['mape']:.1f}%  |  Test R²  {best_r2[1]['r2']:.4f}")
 
 
 if __name__ == "__main__":

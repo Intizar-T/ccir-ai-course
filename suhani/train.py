@@ -3,7 +3,7 @@ Predict Number of Admissions from past air quality and weather (all_features_dat
 
 Uses 1-, 3-, 7-day lags and 3- and 7-day rolling means for all air/weather features (no same-day),
 plus time features and admission_lag7 (same weekday last week). Pipeline: load → preprocess
-→ feature engineering → time-aware split → train models → report comparison and best by Test R².
+→ feature engineering → TimeSeriesSplit CV + holdout test → train models → report MAE, RMSE, MAPE, R².
 """
 
 import os
@@ -14,6 +14,7 @@ from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.svm import SVR
@@ -41,10 +42,10 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 USE_IMPUTATION = True
 WINSORIZE_QUANTILE = 0.99
-TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.80, 0.10, 0.10
-USE_RANDOM_SPLIT = False
+TEST_FRAC = 0.10  # Holdout test (chronological tail)
+N_CV_FOLDS = 5    # TimeSeriesSplit folds on data before holdout
 SPLIT_RANDOM_STATE = 42
-SCALER_TYPE = "standard"
+SCALER_TYPE = "robust"
 
 LAG_DAYS = [1, 3, 7]
 ROLL_WINDOWS = [3, 7]
@@ -205,34 +206,9 @@ def feature_engineering(df):
     return df.reset_index(drop=True)
 
 
-def _time_aware_split_indices(n, train_frac, val_frac, test_frac):
-    """Return (train_ix, val_ix, test_ix) as index arrays for chronological split."""
-    n_train = int(n * train_frac)
-    n_val = int(n * val_frac)
-    train_ix = np.arange(0, n_train)
-    val_ix = np.arange(n_train, n_train + n_val)
-    test_ix = np.arange(n_train + n_val, n)
-    return train_ix, val_ix, test_ix
-
-
-def _random_split_indices(n, train_frac, val_frac, test_frac, random_state=None):
-    """Return (train_ix, val_ix, test_ix) as index arrays for random split."""
-    rng = np.random.default_rng(random_state if random_state is not None else SPLIT_RANDOM_STATE)
-    perm = rng.permutation(n)
-    n_train = int(n * train_frac)
-    n_val = int(n * val_frac)
-    train_ix = perm[:n_train]
-    val_ix = perm[n_train : n_train + n_val]
-    test_ix = perm[n_train + n_val :]
-    return train_ix, val_ix, test_ix
-
-
-def training_data_split(df, train_frac=None, val_frac=None, test_frac=None, use_random_split=None):
-    train_frac = train_frac if train_frac is not None else TRAIN_FRAC
-    val_frac = val_frac if val_frac is not None else VAL_FRAC
+def cv_and_holdout_split(df, test_frac=None):
+    """Chronological split: first (1-test_frac) for CV, last test_frac for holdout. Returns unscaled arrays."""
     test_frac = test_frac if test_frac is not None else TEST_FRAC
-    use_random = use_random_split if use_random_split is not None else USE_RANDOM_SPLIT
-    assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-9
     feat_cols = [c for c in get_feature_columns(df) if c in df.columns]
     if not feat_cols:
         raise ValueError("No feature columns found in df.")
@@ -241,21 +217,21 @@ def training_data_split(df, train_frac=None, val_frac=None, test_frac=None, use_
     if isinstance(y, pd.DataFrame):
         y = y.squeeze(axis=1)
     n = len(df)
-    if use_random:
-        train_ix, val_ix, test_ix = _random_split_indices(n, train_frac, val_frac, test_frac)
-    else:
-        train_ix, val_ix, test_ix = _time_aware_split_indices(n, train_frac, val_frac, test_frac)
-    X_train = X.iloc[train_ix].copy()
-    X_val = X.iloc[val_ix].copy()
-    X_test = X.iloc[test_ix].copy()
-    y_train = y.iloc[train_ix]
-    y_val = y.iloc[val_ix]
-    y_test = y.iloc[test_ix]
-    scaler = RobustScaler() if SCALER_TYPE == "robust" else StandardScaler()
-    X_train = pd.DataFrame(scaler.fit_transform(X_train), columns=feat_cols, index=X_train.index)
-    X_val = pd.DataFrame(scaler.transform(X_val), columns=feat_cols, index=X_val.index)
-    X_test = pd.DataFrame(scaler.transform(X_test), columns=feat_cols, index=X_test.index)
-    return X_train, X_val, X_test, y_train, y_val, y_test, scaler
+    n_test = int(n * test_frac)
+    n_cv = n - n_test
+    X_cv = X.iloc[:n_cv].values
+    y_cv = y.iloc[:n_cv].values
+    X_test = X.iloc[n_cv:].values
+    y_test = y.iloc[n_cv:].values
+    return X_cv, y_cv, X_test, y_test, feat_cols
+
+
+def mean_absolute_percentage_error_safe(y_true, y_pred, eps=1e-8):
+    """MAPE in percent (0-100+). Uses eps to avoid div-by-zero when y_true is 0."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.maximum(np.abs(y_true), eps)
+    return float(np.mean(np.abs(y_true - y_pred) / denom) * 100)
 
 
 def evaluate_model(model, X, y):
@@ -263,6 +239,7 @@ def evaluate_model(model, X, y):
     return {
         "mae": mean_absolute_error(y, pred),
         "rmse": np.sqrt(mean_squared_error(y, pred)),
+        "mape": mean_absolute_percentage_error_safe(y, pred),
         "r2": r2_score(y, pred),
     }
 
@@ -271,13 +248,13 @@ def dummy_regression_model():
     return DummyRegressor(strategy="mean")
 
 
-def ridge_tuned_model(cv=5):
-    return RidgeCV(alphas=np.logspace(-3, 2, 100), cv=cv)
+def ridge_tuned_model(ts_cv=None):
+    return RidgeCV(alphas=np.logspace(-3, 2, 100), cv=ts_cv if ts_cv is not None else 5)
 
 
 class RidgeLogTarget:
-    def __init__(self):
-        self._model = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=5)
+    def __init__(self, ts_cv=None):
+        self._model = RidgeCV(alphas=np.logspace(-3, 2, 100), cv=ts_cv if ts_cv is not None else 5)
 
     def fit(self, X, y):
         self._model.fit(X, np.log1p(y))
@@ -287,8 +264,13 @@ class RidgeLogTarget:
         return np.expm1(self._model.predict(X))
 
 
-def elastic_net_cv_model(cv=5):
-    return ElasticNetCV(cv=cv, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=np.logspace(-3, 1, 50), max_iter=5000)
+def elastic_net_cv_model(ts_cv=None):
+    return ElasticNetCV(
+        cv=ts_cv if ts_cv is not None else 5,
+        l1_ratio=[0.1, 0.5, 0.9, 1.0],
+        alphas=np.logspace(-3, 1, 50),
+        max_iter=5000,
+    )
 
 
 def random_forest_regression_model(random_state=42):
@@ -828,13 +810,104 @@ def run_all_models(X_train, X_val, X_test, y_train, y_val, y_test):
         ("XGBoost", XGBRegressorWrapper(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=RANDOM_STATE)),
         ("Keras", KerasRegressorWrapper(epochs=200, patience=15)),
     ]
+
+def _get_model_factories(inner_ts_cv=None):
+    """Return list of (name, factory) where factory() returns a fresh model instance."""
+    return [
+        ("Dummy (mean)", lambda: dummy_regression_model()),
+        ("Ridge (CV)", lambda: ridge_tuned_model(ts_cv=inner_ts_cv)),
+        ("Ridge (log y)", lambda: RidgeLogTarget(ts_cv=inner_ts_cv)),
+        ("ElasticNet (CV)", lambda: elastic_net_cv_model(ts_cv=inner_ts_cv)),
+        ("Random Forest", lambda: random_forest_regression_model()),
+        ("Gradient Boosting", lambda: gradient_boosting_model()),
+        ("Hist Gradient Boosting", lambda: hist_gradient_boosting_model()),
+        ("Extra Trees", lambda: extra_trees_model()),
+        ("FNN (MLP)", lambda: fnn_model()),
+        ("SVR", lambda: svm_model()),
+        ("XGBoost", lambda: xgboost_model()),
+        ("Keras", lambda: KerasRegressorWrapper(epochs=200, patience=15)),
+    ]
+
+
+def _fit_and_evaluate(model, X_train, y_train, X_val, y_val, is_keras=False):
+    """Fit model and return validation metrics."""
+    if is_keras:
+        model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+    else:
+        model.fit(X_train, y_train)
+    return evaluate_model(model, X_val, y_val)
+
+
+def run_time_series_cv(X_cv, y_cv, feat_cols):
+    """
+    Run TimeSeriesSplit cross-validation. Returns list of (name, cv_metrics) where
+    cv_metrics = {mae: (mean, std), rmse: (...), mape: (...), r2: (...)}.
+    """
+    tscv = TimeSeriesSplit(n_splits=N_CV_FOLDS)
+    scaler_cls = RobustScaler if SCALER_TYPE == "robust" else StandardScaler
+    factories = _get_model_factories()
+
     results = []
-    for name, model in models:
+    for name, factory in factories:
+        fold_metrics = []
+        for fold, (train_ix, val_ix) in enumerate(tscv.split(X_cv)):
+            X_tr = X_cv[train_ix]
+            y_tr = y_cv[train_ix]
+            X_va = X_cv[val_ix]
+            y_va = y_cv[val_ix]
+            scaler = scaler_cls()
+            X_tr_sc = scaler.fit_transform(X_tr)
+            X_va_sc = scaler.transform(X_va)
+            n_train = len(train_ix)
+            inner_ts = (
+                TimeSeriesSplit(n_splits=min(3, n_train // 20))
+                if n_train >= 40
+                else None
+            )
+            if name in ("Ridge (CV)", "Ridge (log y)", "ElasticNet (CV)") and inner_ts is not None:
+                factories_fold = _get_model_factories(inner_ts_cv=inner_ts)
+                model = next(f for n, f in factories_fold if n == name)()
+            else:
+                model = factory()
+            m = _fit_and_evaluate(
+                model, X_tr_sc, y_tr, X_va_sc, y_va, is_keras=("Keras" in name)
+            )
+            fold_metrics.append(m)
+        means = {k: np.mean([f[k] for f in fold_metrics]) for k in fold_metrics[0]}
+        stds = {k: np.std([f[k] for f in fold_metrics]) for k in fold_metrics[0]}
+        results.append((name, {k: (means[k], stds[k]) for k in means}))
+    return results
+
+
+def run_holdout_evaluation(X_cv, y_cv, X_test, y_test, feat_cols):
+    """
+    Train on full CV data, evaluate on holdout test. Returns list of (name, test_metrics).
+    """
+    scaler_cls = RobustScaler if SCALER_TYPE == "robust" else StandardScaler
+    scaler = scaler_cls()
+    X_cv_sc = scaler.fit_transform(X_cv)
+    X_test_sc = scaler.transform(X_test)
+    inner_ts = (
+        TimeSeriesSplit(n_splits=min(3, len(X_cv) // 20))
+        if len(X_cv) >= 40
+        else None
+    )
+    factories = _get_model_factories(inner_ts_cv=inner_ts)
+
+    results = []
+    for name, factory in factories:
+        model = factory()
         if "Keras" in name:
-            model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+            n_val = max(1, len(X_cv) // 10)
+            X_tr_sc = X_cv_sc[:-n_val]
+            y_tr = y_cv[:-n_val]
+            X_va_sc = X_cv_sc[-n_val:]
+            y_va = y_cv[-n_val:]
+            model.fit(X_tr_sc, y_tr, X_val=X_va_sc, y_val=y_va)
         else:
-            model.fit(X_train, y_train)
-        results.append((name, evaluate_model(model, X_val, y_val), evaluate_model(model, X_test, y_test)))
+            model.fit(X_cv_sc, y_cv)
+        test_m = evaluate_model(model, X_test_sc, y_test)
+        results.append((name, test_m))
     return results
 def run_classification_pipeline():
     """
@@ -1104,13 +1177,74 @@ def main():
     df = feature_engineering(df)
     n_fe = len(df)
 
+    # print("Data: load → preprocess → feature_eng")
+    # print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
+    # print(f"  Features after FE: {len(get_feature_columns(df))} cols")
+    # print(f"  Time-series CV folds: {N_SPLITS}\n")
+
+    # # 5-fold time-aware CV for regression (includes Optuna-tuned models)
+    # run_regression_time_series_cv(df)
+    
+    X_cv, y_cv, X_test, y_test, feat_cols = cv_and_holdout_split(df)
+
     print("Data: load → preprocess → feature_eng")
     print(f"  Rows: {n_load} → {n_pre} (impute={USE_IMPUTATION}) → {n_fe}")
-    print(f"  Features after FE: {len(get_feature_columns(df))} cols")
-    print(f"  Time-series CV folds: {N_SPLITS}\n")
+    print(f"  Features: {len(feat_cols)} cols")
+    print(f"  Split: TimeSeriesSplit({N_CV_FOLDS} folds) on CV | holdout test ({TEST_FRAC*100:.0f}%)")
+    print(f"  CV samples: {len(y_cv)} | Test samples: {len(y_test)}\n")
 
-    # 5-fold time-aware CV for regression (includes Optuna-tuned models)
-    run_regression_time_series_cv(df)
+    print("Running TimeSeriesSplit CV...")
+    cv_results = run_time_series_cv(X_cv, y_cv, feat_cols)
+
+    print("Training on full CV data, evaluating on holdout...")
+    holdout_results = run_holdout_evaluation(X_cv, y_cv, X_test, y_test, feat_cols)
+
+    # Model comparison: CV mean ± std | Holdout
+    w = 140
+    print("\nModel comparison (CV mean ± std | Holdout test)")
+    print("-" * w)
+    header = (
+        f"{'Model':<22} | {'CV MAE':>12} {'CV RMSE':>12} {'CV MAPE%':>12} {'CV R²':>12}  |  "
+        f"{'Test MAE':>8} {'Test RMSE':>8} {'Test MAPE%':>9} {'Test R²':>8}"
+    )
+    print(header)
+    print("-" * w)
+    for (name, cv_m), (_, test_m) in zip(cv_results, holdout_results):
+        row = (
+            f"{name:<22} | {cv_m['mae'][0]:.4f}±{cv_m['mae'][1]:.4f} "
+            f"{cv_m['rmse'][0]:.4f}±{cv_m['rmse'][1]:.4f} "
+            f"{cv_m['mape'][0]:.2f}±{cv_m['mape'][1]:.2f} "
+            f"{cv_m['r2'][0]:.4f}±{cv_m['r2'][1]:.4f}  |  "
+            f"{test_m['mae']:>8.4f} {test_m['rmse']:>8.4f} {test_m['mape']:>9.2f} {test_m['r2']:>8.4f}"
+        )
+        print(row)
+    print("-" * w)
+
+    # Best model by each metric (Holdout test)
+    best_mae = min(holdout_results, key=lambda r: r[1]["mae"])
+    best_rmse = min(holdout_results, key=lambda r: r[1]["rmse"])
+    best_mape = min(holdout_results, key=lambda r: r[1]["mape"])
+    best_r2 = max(holdout_results, key=lambda r: r[1]["r2"])
+
+    print("\nBest by Holdout Test metric:")
+    print(f"  MAE:   {best_mae[0]:<20}  (MAE   = {best_mae[1]['mae']:.4f})")
+    print(f"  RMSE:  {best_rmse[0]:<20}  (RMSE  = {best_rmse[1]['rmse']:.4f})")
+    print(f"  MAPE:  {best_mape[0]:<20}  (MAPE  = {best_mape[1]['mape']:.2f}%)")
+    print(f"  R²:    {best_r2[0]:<20}  (R²    = {best_r2[1]['r2']:.4f})")
+
+    # Literature comparison
+    print("\n" + "=" * 60)
+    print("Literature comparison (air quality + weather → admissions)")
+    print("=" * 60)
+    print("  npj Digital Medicine (2022), ED admissions:")
+    print("    MAE 4.0 (17% error) vs benchmark 6.5 (32%)")
+    print("  Nature Sci Rep (2023), German ER visits:")
+    print("    Air+weather explained ~6% of variance (mobility ~63%)")
+    print("  Multi-city air pollution–mortality:")
+    print("    R² typically <1%–13% for environmental predictors")
+    print("-" * 60)
+    print("  This study (air+weather+lags, single site, daily, TimeSeriesSplit CV):")
+    print(f"    Test MAE  {best_mae[1]['mae']:.2f}  |  Test MAPE  {best_mape[1]['mape']:.1f}%  |  Test R²  {best_r2[1]['r2']:.4f}")
 
 
 if __name__ == "__main__":
