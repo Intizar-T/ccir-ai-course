@@ -54,8 +54,7 @@ TIMESTAMP_COL = "Timestamp"
 DATE_COL = "Date"
 TARGET_COL = "Number of Admissions"
 
-TIME_FEATURES = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend"]
-# Extra configuration for Optuna tuning and classification
+TIME_FEATURES = ["dow_sin", "dow_cos", "month_sin", "month_cos", "weekend", "month_regime", "year_regime"]# Extra configuration for Optuna tuning and classification
 THRESHOLD = 20           # admissions threshold for binary classification
 N_SPLITS = 5             # time-series CV splits 
 N_TRIALS = 25            # Optuna trials per tunable model
@@ -64,8 +63,8 @@ WIND_DIR_COL = "wind_direction_10m_dominant (°)"
 
 
 def get_raw_feature_columns(df):
-    """Numeric air/weather columns only (exclude date, target, and outcome-like columns)."""
-    exclude = {DATE_COL, TARGET_COL}
+    """Numeric air/weather columns only (exclude date, target, wind direction, and outcome-like columns)."""
+    exclude = {DATE_COL, TARGET_COL, WIND_DIR_COL}
     outcome_like = ["brought_dead", "admission"]
     return [
         c for c in df.columns
@@ -175,7 +174,19 @@ def feature_engineering(df):
     df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
     df["weekend"] = (dt.dt.dayofweek >= 5).astype(np.float64)
 
+    # Regime indicators (month, year trend)
+    df["month_regime"] = dt.dt.month
+    years = dt.dt.year
+    year_order = {y: i + 1 for i, y in enumerate(sorted(years.unique()))}
+    df["year_regime"] = years.map(year_order)
+
+    # Wind direction encoding (cyclical; raw WIND_DIR_COL excluded from raw_cols)
+    if WIND_DIR_COL in df.columns:
+        df["wind_sin"] = np.sin(2 * np.pi * df[WIND_DIR_COL] / 360)
+        df["wind_cos"] = np.cos(2 * np.pi * df[WIND_DIR_COL] / 360)
+
     raw_cols = get_raw_feature_columns(df)
+
     new_cols = {}
     lag_roll_cols = []
     for col in raw_cols:
@@ -848,8 +859,8 @@ def run_classification_pipeline():
         years = df["Timestamp"].dt.year
         year_order = {year: i + 1 for i, year in enumerate(sorted(years.unique()))}
         df["year_regime"] = years.map(year_order)
-        df["weekend"] = (df["Timestamp"].dt.dayofweek >= 5).astype(int)
-
+        df["weekend"] = (df["Timestamp"].dt.dayofweek >= 5).astype(np.float64)
+        
         if WIND_DIR_COL in df.columns:
             df["wind_sin"] = np.sin(2 * np.pi * df[WIND_DIR_COL] / 360)
             df["wind_cos"] = np.cos(2 * np.pi * df[WIND_DIR_COL] / 360)
