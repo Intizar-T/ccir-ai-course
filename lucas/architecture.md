@@ -401,6 +401,31 @@ Saved artifacts include:
 
 The stacking ensembles are evaluated but are not currently persisted.
 
+### Visualizations
+
+After all models are trained and evaluated, `insidertradingtrain.py` calls `generate_visualizations()`, which writes 14 research-paper-quality figures to `figures/`:
+
+| File | Description |
+|------|-------------|
+| `01_classification_model_comparison.png` | Grouped horizontal bar: PR-AUC, ROC-AUC, F1, Accuracy for all classifiers; dummy baseline reference lines |
+| `02_regression_model_comparison.png` | Two-panel: R²/Spearman/Sign Accuracy + RMSE for all regressors |
+| `03_roc_curves.png` | All classifiers overlaid; AUC in legend; diagonal no-skill line |
+| `04_pr_curves.png` | All classifiers; PR-AUC in legend; horizontal prevalence baseline |
+| `05_confusion_matrix_top1.png` | Annotated heatmap (counts + row-%) for top-ranked classifier |
+| `06_confusion_matrix_top2.png` | Same for 2nd-ranked classifier |
+| `07_feature_importance_clf_top1.png` | Top-20 features, color-coded by group (raw/log/ratio/role/temporal/interaction) |
+| `08_feature_importance_clf_top2.png` | Same for 2nd-ranked classifier (skipped for SVM/stacking) |
+| `09_feature_importance_reg_top1.png` | Same structure for top regressor |
+| `10_calibration_curves.png` | Reliability diagram for top-3 classifiers; Brier score in legend |
+| `11_reg_prediction_vs_actual.png` | Scatter of predicted vs actual excess return; 45° line; quadrant coloring |
+| `12_reg_residuals.png` | Residuals vs predicted + residual histogram with KDE and normal overlay |
+| `13_excess_return_by_quartile.png` | Box-whisker of actual excess returns per prediction quartile for top classifier and top regressor |
+| `14_feature_correlation_heatmap.png` | Seaborn clustermap of Spearman correlation between all features; lower triangle only |
+
+Rankings for "top-1/top-2" are determined at runtime from `results_class` (by PR-AUC) and `results_reg` (by R²), excluding the dummy baseline. Every figure block is individually `try/except`-wrapped so a single failure does not block the rest.
+
+The visualization step requires `matplotlib>=3.7` and `seaborn>=0.13` (both now listed in `requirements.txt`). The `Agg` backend is used so figures render correctly in headless/script environments.
+
 ## Generated Artifacts
 
 The repo currently mixes code and generated outputs in the root directory.
@@ -413,6 +438,7 @@ Common generated artifacts include:
 - `features_with_labels.csv`
 - `market_prices_clean.csv`
 - `models/*.joblib`
+- `figures/*.png`
 
 ## Runtime Characteristics
 
@@ -430,6 +456,7 @@ Common generated artifacts include:
 - Runs entirely from local CSV input
 - Can still take a long time because of Optuna tuning and heavier model families
 - Uses all CPU cores for some models (`RandomForest`, `LightGBM`)
+- After training, automatically generates 14 figures in `figures/` using matplotlib/seaborn
 
 ## Dependency Notes
 
@@ -443,6 +470,8 @@ Common generated artifacts include:
 - `lightgbm`
 - `joblib`
 - `optuna`
+- `matplotlib`
+- `seaborn`
 
 Important caveat:
 

@@ -21,6 +21,13 @@ import joblib
 import warnings
 warnings.filterwarnings('ignore')
 
+import matplotlib
+matplotlib.use('Agg')   # headless backend, safe for scripts
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import roc_curve, precision_recall_curve
+
 try:
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -794,6 +801,527 @@ _OPTUNA_FUNCS = {
 _EARLY_STOP_MODELS = {'XGBoost', 'LightGBM', 'XGBoost Regressor', 'LightGBM Regressor'}
 
 
+# ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
+
+def _get_proba(model_name, clf, X, stackable_clf, stack_meta):
+    """Return positive-class probabilities or None. Handles stacking."""
+    if model_name == 'Stacking Ensemble':
+        if stack_meta is None or stackable_clf is None:
+            return None
+        try:
+            cols = []
+            for m in stackable_clf:
+                try:
+                    cols.append(m.predict_proba(X)[:, 1])
+                except Exception:
+                    cols.append(m.predict(X).astype(float))
+            S = np.column_stack(cols)
+            return stack_meta.predict_proba(S)[:, 1]
+        except Exception:
+            return None
+    try:
+        return clf.predict_proba(X)[:, 1]
+    except Exception:
+        return None
+
+
+def _top2_clf(results_class):
+    """Return list of top-2 non-dummy classifier names by PR-AUC."""
+    ranked = sorted(
+        [(n, m.get('pr_auc', 0)) for n, m in results_class.items()
+         if n not in ('Dummy (Baseline)',) and not np.isnan(m.get('pr_auc', float('nan')))],
+        key=lambda x: x[1], reverse=True,
+    )
+    return [n for n, _ in ranked[:2]]
+
+
+def _top2_reg(results_reg):
+    """Return list of top-2 non-dummy regressor names by R²."""
+    ranked = sorted(
+        [(n, m.get('r2', -999)) for n, m in results_reg.items()
+         if n not in ('Dummy (Baseline)',)],
+        key=lambda x: x[1], reverse=True,
+    )
+    return [n for n, _ in ranked[:2]]
+
+
+def _get_feature_importances(model, feature_names):
+    """Return (importances_array, label) or (None, None) for unsupported models."""
+    name = type(model).__name__
+    if name in ('RandomForestClassifier', 'RandomForestRegressor',
+                'XGBClassifier', 'XGBRegressor',
+                'LGBMClassifier', 'LGBMRegressor'):
+        return model.feature_importances_, 'Feature Importance'
+    if name == 'LogisticRegression':
+        coef = model.coef_
+        return np.abs(coef[0] if coef.ndim > 1 else coef), '|Coefficient|'
+    if name == 'Ridge':
+        return np.abs(model.coef_), '|Coefficient|'
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Main visualization function
+# ---------------------------------------------------------------------------
+
+def generate_visualizations(
+    train_only_clf, train_only_reg,
+    stack_meta, stack_reg_meta,
+    stackable_clf, stackable_reg,
+    results_class, results_reg,
+    X_train, X_val, X_test,
+    y_class_train, y_class_val, y_class_test,
+    y_reg_train, y_reg_val, y_reg_test,
+    feature_names, script_dir,
+):
+    """Generate all 14 research-paper figures and save to figures/ directory."""
+    figures_dir = os.path.join(script_dir, 'figures')
+    os.makedirs(figures_dir, exist_ok=True)
+
+    sns.set_style('whitegrid')
+    plt.rcParams.update({'font.size': 12, 'figure.dpi': 300})
+
+    # Consistent color mapping
+    all_clf_names = list(results_class.keys())
+    all_reg_names = list(results_reg.keys())
+    tab10 = plt.get_cmap('tab10')
+    clf_colors = {n: tab10(i % 10) for i, n in enumerate(all_clf_names)}
+    reg_colors = {n: tab10(i % 10) for i, n in enumerate(all_reg_names)}
+
+    # Feature group color mapping
+    _feature_groups = {
+        'raw': ['num_buy_transactions', 'total_shares_bought', 'total_value_bought',
+                'avg_transaction_value', 'close', 'shares_traded_pct',
+                'has_officer_buy', 'has_director_buy', 'has_ten_pct_owner_buy',
+                'shares_traded_pct_missing'],
+        'log': ['log_total_value_bought', 'log_avg_transaction_value',
+                'log_total_shares_bought', 'log_close',
+                'log_num_buy_transactions', 'log_total_shares_count'],
+        'ratio': ['value_per_share', 'price_premium', 'value_to_market_cap'],
+        'role': ['insider_type_count'],
+        'temporal': ['month_sin', 'month_cos', 'dow_sin', 'dow_cos'],
+        'interaction': ['officer_director_combo', 'log_value_x_transactions',
+                        'officer_value', 'director_value'],
+    }
+    _group_palette = {
+        'raw': '#4e79a7', 'log': '#f28e2b', 'ratio': '#e15759',
+        'role': '#76b7b2', 'temporal': '#59a14f', 'interaction': '#b07aa1',
+    }
+
+    def _feat_color(feat):
+        for grp, feats in _feature_groups.items():
+            if feat in feats:
+                return _group_palette[grp]
+        return '#aaa'
+
+    def _savefig(fig, fname):
+        path = os.path.join(figures_dir, fname)
+        fig.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [VIZ] saved {fname}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 1 – Classification model comparison                          #
+    # ------------------------------------------------------------------ #
+    try:
+        metrics_order = ['pr_auc', 'roc_auc', 'f1', 'accuracy']
+        metric_labels = ['PR-AUC', 'ROC-AUC', 'F1', 'Accuracy']
+        clf_names_sorted = sorted(
+            results_class.keys(),
+            key=lambda n: results_class[n].get('pr_auc', 0), reverse=True,
+        )
+        n_models = len(clf_names_sorted)
+        n_metrics = len(metrics_order)
+        bar_h = 0.18
+        offsets = np.linspace(-(n_metrics - 1) / 2, (n_metrics - 1) / 2, n_metrics) * bar_h
+
+        fig, ax = plt.subplots(figsize=(10, max(5, n_models * 0.9)))
+        y_pos = np.arange(n_models)
+        for mi, (met, lbl) in enumerate(zip(metrics_order, metric_labels)):
+            vals = [results_class[n].get(met, 0) for n in clf_names_sorted]
+            ax.barh(y_pos + offsets[mi], vals, height=bar_h, label=lbl)
+
+        # Dummy reference lines
+        dummy_metrics = results_class.get('Dummy (Baseline)', {})
+        for met, lbl, ls in zip(
+            ['pr_auc', 'roc_auc'],
+            ['Dummy PR-AUC', 'Dummy ROC-AUC'],
+            ['--', ':'],
+        ):
+            v = dummy_metrics.get(met)
+            if v and not np.isnan(v):
+                ax.axvline(v, color='red', linestyle=ls, linewidth=1.2, label=lbl)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(clf_names_sorted)
+        ax.set_xlabel('Score')
+        ax.set_title('Classification Model Comparison')
+        ax.legend(loc='lower right', fontsize=9)
+        ax.set_xlim(0, 1.05)
+        fig.tight_layout()
+        _savefig(fig, '01_classification_model_comparison.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 01: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 2 – Regression model comparison                              #
+    # ------------------------------------------------------------------ #
+    try:
+        reg_names_sorted = sorted(
+            results_reg.keys(),
+            key=lambda n: results_reg[n].get('r2', -999), reverse=True,
+        )
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(5, len(reg_names_sorted) * 0.8)))
+        y_pos = np.arange(len(reg_names_sorted))
+        bar_h = 0.25
+        offsets3 = np.array([-bar_h, 0, bar_h])
+        metrics3 = ['r2', 'spearman', 'sign_accuracy']
+        labels3 = ['R²', 'Spearman ρ', 'Sign Acc']
+        for mi, (met, lbl) in enumerate(zip(metrics3, labels3)):
+            vals = [results_reg[n].get(met, 0) for n in reg_names_sorted]
+            ax1.barh(y_pos + offsets3[mi], vals, height=bar_h, label=lbl)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(reg_names_sorted)
+        ax1.set_xlabel('Score')
+        ax1.set_title('R² / Spearman / Sign Accuracy')
+        ax1.legend(fontsize=9)
+
+        rmse_vals = [results_reg[n].get('rmse', 0) for n in reg_names_sorted]
+        colors_reg = [reg_colors[n] for n in reg_names_sorted]
+        ax2.barh(y_pos, rmse_vals, color=colors_reg)
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(reg_names_sorted)
+        ax2.set_xlabel('RMSE')
+        ax2.set_title('RMSE (lower is better)')
+        fig.suptitle('Regression Model Comparison', fontsize=14, y=1.01)
+        fig.tight_layout()
+        _savefig(fig, '02_regression_model_comparison.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 02: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 3 – ROC curves                                               #
+    # ------------------------------------------------------------------ #
+    try:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='No skill')
+        for name in all_clf_names:
+            clf = train_only_clf.get(name)
+            proba = _get_proba(name, clf, X_test, stackable_clf, stack_meta)
+            if proba is None:
+                continue
+            fpr, tpr, _ = roc_curve(y_class_test, proba)
+            auc_val = results_class[name].get('roc_auc', 0)
+            ax.plot(fpr, tpr, color=clf_colors[name], linewidth=1.5,
+                    label=f"{name} (AUC={auc_val:.3f})")
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('ROC Curves – Classification Models')
+        ax.legend(fontsize=8, loc='lower right')
+        fig.tight_layout()
+        _savefig(fig, '03_roc_curves.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 03: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 4 – PR curves                                                #
+    # ------------------------------------------------------------------ #
+    try:
+        prevalence = y_class_test.mean()
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.axhline(prevalence, color='red', linestyle='--', linewidth=1,
+                   label=f'Prevalence ({prevalence:.3f})')
+        for name in all_clf_names:
+            clf = train_only_clf.get(name)
+            proba = _get_proba(name, clf, X_test, stackable_clf, stack_meta)
+            if proba is None:
+                continue
+            prec_c, rec_c, _ = precision_recall_curve(y_class_test, proba)
+            pr_auc_val = results_class[name].get('pr_auc', 0)
+            ax.plot(rec_c, prec_c, color=clf_colors[name], linewidth=1.5,
+                    label=f"{name} (PR-AUC={pr_auc_val:.3f})")
+        ax.set_xlabel('Recall')
+        ax.set_ylabel('Precision')
+        ax.set_title('Precision-Recall Curves – Classification Models')
+        ax.legend(fontsize=8, loc='upper right')
+        fig.tight_layout()
+        _savefig(fig, '04_pr_curves.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 04: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figures 5 & 6 – Confusion matrices (top-2 classifiers)             #
+    # ------------------------------------------------------------------ #
+    top2_clf = _top2_clf(results_class)
+    for fig_num, model_name in zip([5, 6], top2_clf):
+        try:
+            clf = train_only_clf.get(model_name)
+            proba = _get_proba(model_name, clf, X_test, stackable_clf, stack_meta)
+            thr = results_class[model_name].get('threshold', 0.5)
+            if proba is not None:
+                y_pred_cm = (proba >= thr).astype(int)
+            else:
+                y_pred_cm = clf.predict(X_test)
+            cm = confusion_matrix(y_class_test, y_pred_cm)
+            cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            sns.heatmap(cm, annot=False, fmt='d', cmap='Blues', ax=ax,
+                        linewidths=0.5, linecolor='gray')
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    ax.text(j + 0.5, i + 0.5,
+                            f"{cm[i, j]}\n({cm_norm[i, j]:.1%})",
+                            ha='center', va='center', fontsize=11,
+                            color='white' if cm_norm[i, j] > 0.5 else 'black')
+            ax.set_xticklabels(['Pred 0', 'Pred 1'])
+            ax.set_yticklabels(['Actual 0', 'Actual 1'], rotation=0)
+            ax.set_title(f"Confusion Matrix – {model_name}\n(threshold={thr:.2f})")
+            fig.tight_layout()
+            fname = f"0{fig_num}_confusion_matrix_top{'1' if fig_num == 5 else '2'}.png"
+            _savefig(fig, fname)
+        except Exception as e:
+            print(f"  [WARN] skipped fig 0{fig_num}: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figures 7 & 8 – Feature importance (top-2 classifiers)             #
+    # ------------------------------------------------------------------ #
+    for fig_num, model_name in zip([7, 8], top2_clf):
+        try:
+            clf = train_only_clf.get(model_name)
+            imps, imp_label = _get_feature_importances(clf, feature_names)
+            if imps is None:
+                print(f"  [INFO] fig 0{fig_num} skipped (no importances for {model_name})")
+                continue
+            top_n = min(20, len(feature_names))
+            idx = np.argsort(imps)[-top_n:]
+            feats = [feature_names[i] for i in idx]
+            vals = imps[idx]
+            colors = [_feat_color(f) for f in feats]
+
+            fig, ax = plt.subplots(figsize=(9, max(5, top_n * 0.38)))
+            ax.barh(range(top_n), vals, color=colors)
+            ax.set_yticks(range(top_n))
+            ax.set_yticklabels(feats, fontsize=9)
+            ax.set_xlabel(imp_label)
+            ax.set_title(f"Feature Importance – {model_name} (Top {top_n})")
+
+            # Legend for groups
+            handles = [plt.Rectangle((0, 0), 1, 1, color=c, label=g)
+                       for g, c in _group_palette.items()]
+            ax.legend(handles=handles, title='Feature Group',
+                      fontsize=8, loc='lower right')
+            fig.tight_layout()
+            suffix = 'top1' if fig_num == 7 else 'top2'
+            _savefig(fig, f"0{fig_num}_feature_importance_clf_{suffix}.png")
+        except Exception as e:
+            print(f"  [WARN] skipped fig 0{fig_num}: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 9 – Feature importance (top-1 regressor)                    #
+    # ------------------------------------------------------------------ #
+    top2_reg_names = _top2_reg(results_reg)
+    for fig_num, model_name in zip([9], top2_reg_names[:1]):
+        try:
+            reg = train_only_reg.get(model_name)
+            imps, imp_label = _get_feature_importances(reg, feature_names)
+            if imps is None:
+                print(f"  [INFO] fig 09 skipped (no importances for {model_name})")
+                continue
+            top_n = min(20, len(feature_names))
+            idx = np.argsort(imps)[-top_n:]
+            feats = [feature_names[i] for i in idx]
+            vals = imps[idx]
+            colors = [_feat_color(f) for f in feats]
+
+            fig, ax = plt.subplots(figsize=(9, max(5, top_n * 0.38)))
+            ax.barh(range(top_n), vals, color=colors)
+            ax.set_yticks(range(top_n))
+            ax.set_yticklabels(feats, fontsize=9)
+            ax.set_xlabel(imp_label)
+            ax.set_title(f"Feature Importance – {model_name} (Top {top_n})")
+            handles = [plt.Rectangle((0, 0), 1, 1, color=c, label=g)
+                       for g, c in _group_palette.items()]
+            ax.legend(handles=handles, title='Feature Group',
+                      fontsize=8, loc='lower right')
+            fig.tight_layout()
+            _savefig(fig, '09_feature_importance_reg_top1.png')
+        except Exception as e:
+            print(f"  [WARN] skipped fig 09: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 10 – Calibration curves (top-3 classifiers)                 #
+    # ------------------------------------------------------------------ #
+    try:
+        top3_names = [n for n in sorted(
+            results_class.keys(),
+            key=lambda n: results_class[n].get('pr_auc', 0), reverse=True,
+        ) if n != 'Dummy (Baseline)'][:3]
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Perfect calibration')
+        for name in top3_names:
+            clf = train_only_clf.get(name)
+            proba = _get_proba(name, clf, X_test, stackable_clf, stack_meta)
+            if proba is None:
+                continue
+            from sklearn.metrics import brier_score_loss
+            brier = brier_score_loss(y_class_test, proba)
+            prob_true, prob_pred = calibration_curve(y_class_test, proba, n_bins=10)
+            ax.plot(prob_pred, prob_true, marker='o', linewidth=1.5,
+                    color=clf_colors[name],
+                    label=f"{name} (Brier={brier:.3f})")
+        ax.set_xlabel('Mean Predicted Probability')
+        ax.set_ylabel('Fraction of Positives')
+        ax.set_title('Calibration Curves – Top-3 Classifiers')
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        _savefig(fig, '10_calibration_curves.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 10: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 11 – Regression: predicted vs actual                        #
+    # ------------------------------------------------------------------ #
+    try:
+        top1_reg = top2_reg_names[0] if top2_reg_names else None
+        if top1_reg:
+            reg = train_only_reg.get(top1_reg)
+            y_pred_reg = reg.predict(X_test)
+            r2_val = results_reg[top1_reg].get('r2', 0)
+            sp_val = results_reg[top1_reg].get('spearman', 0)
+
+            fig, ax = plt.subplots(figsize=(7, 6))
+            lim = max(np.abs(y_reg_test).max(), np.abs(y_pred_reg).max()) * 1.05
+            ax.scatter(y_pred_reg, y_reg_test, alpha=0.3, s=12,
+                       c=np.where((y_pred_reg >= 0) & (y_reg_test >= 0), '#4e79a7',
+                          np.where((y_pred_reg < 0) & (y_reg_test < 0), '#e15759',
+                          '#f28e2b')))
+            ax.plot([-lim, lim], [-lim, lim], 'k--', linewidth=1, label='45° line')
+            ax.axhline(0, color='gray', linewidth=0.7)
+            ax.axvline(0, color='gray', linewidth=0.7)
+            ax.set_xlabel('Predicted Excess Return')
+            ax.set_ylabel('Actual Excess Return')
+            ax.set_title(f"Predicted vs Actual – {top1_reg}")
+            ax.text(0.05, 0.92, f"R²={r2_val:.4f}  Spearman={sp_val:.4f}",
+                    transform=ax.transAxes, fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+            ax.legend()
+            fig.tight_layout()
+            _savefig(fig, '11_reg_prediction_vs_actual.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 11: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 12 – Regression residuals                                   #
+    # ------------------------------------------------------------------ #
+    try:
+        if top1_reg:
+            reg = train_only_reg.get(top1_reg)
+            y_pred_reg = reg.predict(X_test)
+            residuals = y_reg_test - y_pred_reg
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+            ax1.scatter(y_pred_reg, residuals, alpha=0.3, s=12, color='#4e79a7')
+            ax1.axhline(0, color='red', linestyle='--', linewidth=1)
+            ax1.set_xlabel('Predicted Excess Return')
+            ax1.set_ylabel('Residual')
+            ax1.set_title('Residuals vs Predicted')
+
+            from scipy.stats import norm as sp_norm
+            ax2.hist(residuals, bins=40, density=True, alpha=0.6,
+                     color='#4e79a7', label='Residuals')
+            x_range = np.linspace(residuals.min(), residuals.max(), 200)
+            mu, sigma = residuals.mean(), residuals.std()
+            ax2.plot(x_range, sp_norm.pdf(x_range, mu, sigma),
+                     'r-', linewidth=2, label='Normal fit')
+            try:
+                sns.kdeplot(residuals, ax=ax2, color='orange', linewidth=2, label='KDE')
+            except Exception:
+                pass
+            ax2.set_xlabel('Residual')
+            ax2.set_ylabel('Density')
+            ax2.set_title('Residual Distribution')
+            ax2.legend(fontsize=9)
+
+            fig.suptitle(f"Residual Analysis – {top1_reg}", fontsize=13)
+            fig.tight_layout()
+            _savefig(fig, '12_reg_residuals.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 12: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 13 – Excess return by prediction quartile                   #
+    # ------------------------------------------------------------------ #
+    try:
+        top1_clf_name = top2_clf[0] if top2_clf else None
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        panel_info = [
+            (top1_clf_name, 'clf', 'Classifier Score', axes[0]),
+            (top2_reg_names[0] if top2_reg_names else None, 'reg', 'Regressor Prediction', axes[1]),
+        ]
+        for model_name, task, xlabel, ax in panel_info:
+            if model_name is None:
+                ax.set_visible(False)
+                continue
+            try:
+                if task == 'clf':
+                    clf = train_only_clf.get(model_name)
+                    scores = _get_proba(model_name, clf, X_test, stackable_clf, stack_meta)
+                else:
+                    reg = train_only_reg.get(model_name)
+                    scores = reg.predict(X_test)
+                if scores is None:
+                    ax.set_visible(False)
+                    continue
+                quartiles = pd.qcut(scores, q=4, labels=['Q1\n(Low)', 'Q2', 'Q3', 'Q4\n(High)'])
+                df_q = pd.DataFrame({'quartile': quartiles, 'excess_return': y_reg_test})
+                df_q.boxplot(column='excess_return', by='quartile', ax=ax,
+                             flierprops=dict(marker='.', markersize=3, alpha=0.4))
+                ax.axhline(0, color='red', linestyle='--', linewidth=1)
+                ax.set_title(f"{model_name}")
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel('Actual Excess Return (7-day)')
+                plt.sca(ax)
+                plt.title(model_name)
+            except Exception as inner_e:
+                ax.set_visible(False)
+                print(f"  [WARN] fig 13 panel {task}: {inner_e}")
+        fig.suptitle('Actual Excess Returns by Prediction Quartile', fontsize=13, y=1.02)
+        fig.tight_layout()
+        _savefig(fig, '13_excess_return_by_quartile.png')
+    except Exception as e:
+        print(f"  [WARN] skipped fig 13: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Figure 14 – Feature correlation heatmap                            #
+    # ------------------------------------------------------------------ #
+    try:
+        from scipy.stats import spearmanr as sp_corr
+        X_all = np.concatenate([X_train, X_val, X_test], axis=0)
+        corr_matrix, _ = sp_corr(X_all, axis=0)
+        corr_df = pd.DataFrame(corr_matrix, index=feature_names, columns=feature_names)
+
+        mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+
+        g = sns.clustermap(
+            corr_df, mask=mask, cmap='RdBu_r', vmin=-1, vmax=1,
+            figsize=(14, 14), annot=False, linewidths=0.3,
+            dendrogram_ratio=0.12, cbar_pos=(0.02, 0.8, 0.03, 0.15),
+        )
+        g.fig.suptitle('Spearman Feature Correlation (clustered)', y=1.01, fontsize=13)
+        path = os.path.join(figures_dir, '14_feature_correlation_heatmap.png')
+        g.fig.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close(g.fig)
+        print("  [VIZ] saved 14_feature_correlation_heatmap.png")
+    except Exception as e:
+        print(f"  [WARN] skipped fig 14: {e}")
+
+    print(f"\nAll figures saved to: {figures_dir}/")
+
+
 def main():
     print("=" * 80)
     print("INSIDER TRADING ML TRAINING PIPELINE")
@@ -871,11 +1399,13 @@ def main():
                    scaler=splits['scaler'], feature_names=feature_names)
 
     # --- Stacking ensemble (classification) ---
-    stackable = [m for n, m in train_only_clf.items()
-                 if n != 'Dummy (Baseline)']
+    stackable_clf = [m for n, m in train_only_clf.items()
+                     if n != 'Dummy (Baseline)']
+    stack_meta = None
+    stackable = stackable_clf   # existing variable name still used below
     if len(stackable) >= 2:
         print("\n--- Stacking Ensemble (Classification) ---")
-        stack_metrics, stack_meta = _build_stacking_classification(
+        stack_metrics, stack_meta = _build_stacking_classification(  # noqa: F841
             stackable, X_va, y_cls_va, X_te, y_cls_te)
         results_class['Stacking Ensemble'] = stack_metrics
         print(f"  PR-AUC={stack_metrics.get('pr_auc', 0):.4f}  "
@@ -925,11 +1455,12 @@ def main():
                    scaler=splits['scaler'], feature_names=feature_names)
 
     # --- Stacking ensemble (regression) ---
+    stack_reg_meta = None
     stackable_reg = [m for n, m in train_only_reg.items()
                      if n != 'Dummy (Baseline)']
     if len(stackable_reg) >= 2:
         print("\n--- Stacking Ensemble (Regression) ---")
-        stack_reg_metrics, stack_reg_meta = _build_stacking_regression(
+        stack_reg_metrics, stack_reg_meta = _build_stacking_regression(  # noqa: F841
             stackable_reg, X_va, y_reg_va, X_te, y_reg_te)
         results_reg['Stacking Ensemble'] = stack_reg_metrics
         print(f"  R²={stack_reg_metrics['r2']:.6f}  "
@@ -967,6 +1498,24 @@ def main():
               f"RMSE={m.get('rmse', 0):.6f}")
 
     print()
+
+    # =================================================================
+    # 7. Visualizations
+    # ==================================================================
+    print("\n" + "=" * 80)
+    print("GENERATING RESEARCH PAPER VISUALIZATIONS")
+    print("=" * 80)
+    generate_visualizations(
+        train_only_clf=train_only_clf, train_only_reg=train_only_reg,
+        stack_meta=stack_meta, stack_reg_meta=stack_reg_meta,
+        stackable_clf=stackable_clf, stackable_reg=stackable_reg,
+        results_class=results_class, results_reg=results_reg,
+        X_train=X_tr, X_val=X_va, X_test=X_te,
+        y_class_train=y_cls_tr, y_class_val=y_cls_va, y_class_test=y_cls_te,
+        y_reg_train=y_reg_tr, y_reg_val=y_reg_va, y_reg_test=y_reg_te,
+        feature_names=feature_names,
+        script_dir=os.path.dirname(os.path.abspath(__file__)),
+    )
 
 
 if __name__ == '__main__':
